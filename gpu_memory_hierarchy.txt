@@ -1,0 +1,74 @@
+GPU MEMORY HIERARCHY - BLOCK DIAGRAM
+=====================================
+
+                    GPU 0                                         GPU 1
+    +-------------------------------+             +-------------------------------+
+    |  +--------+       +--------+  |             |  +--------+       +--------+  |
+    |  |   SM   |  ...  |   SM   |  |             |  |   SM   |  ...  |   SM   |  |
+    |  |+------+|       |+------+|  |             |  |+------+|       |+------+|  |
+    |  || SMEM ||       || SMEM ||  |             |  || SMEM ||       || SMEM ||  |
+    |  |+------+|       |+------+|  |             |  |+------+|       |+------+|  |
+    |  ||  L1  ||       ||  L1  ||  |             |  ||  L1  ||       ||  L1  ||  |
+    |  |+------+|       |+------+|  |             |  |+------+|       |+------+|  |
+    |  || TMEM ||       || TMEM ||  |             |  || TMEM ||       || TMEM ||  |
+    |  |+------+|       |+------+|  |             |  |+------+|       |+------+|  |
+    |  +---+----+       +---+----+  |             |  +---+----+       +---+----+  |
+    |      |               |        |             |      |               |        |
+    |      +-------+-------+        |             |      +-------+-------+        |
+    |              |                |             |              |                |
+    |        +-----+-----+          |   NVLINK    |        +-----+-----+          |
+    |        |    L2     |<---------+-------------+------->|    L2     |          |
+    |        +-----+-----+          |  (fast GPU  |        +-----+-----+          |
+    |              |                |   to GPU)   |              |                |
+    |        +-----+-----+          |             |        +-----+-----+          |
+    |        |   DRAM    |          |             |        |   DRAM    |          |
+    |        |  (HBM)    |          |             |        |  (HBM)    |          |
+    |        +-----+-----+          |             |        +-----+-----+          |
+    +--------------|----------------+             +--------------|----------------+
+                   |                                             |
+                   |                   PCIe                      |
+                   |            (slower, to CPU)                 |
+                   +----------------------+----------------------+
+                                          |
+                              +-----------+-----------+
+                              |   CPU Host Memory     |
+                              |       (DDR)           |
+                              +-----------------------+
+
+
+MEMORY TYPES
+------------
+Term    Full Name           Location        Speed       Scope
+------------------------------------------------------------------------
+SMEM    Shared Memory       Per-SM          ~19 TB/s    Threads in block
+L1      L1 Cache            Per-SM          ~19 TB/s    Per-SM (automatic)
+TMEM    Tensor Memory       Per-SM          Fast        Tensor cores
+L2      L2 Cache            Per-GPU         ~6 TB/s     All SMs share
+DRAM    HBM (GPU memory)    Per-GPU         ~3 TB/s     All SMs share
+Host    DDR (CPU memory)    CPU side        ~100 GB/s   CPU processes
+
+
+INTERCONNECTS
+-------------
+Path                    Bandwidth (approx)      Use Case
+------------------------------------------------------------------------
+SM <-> L1/SMEM          ~19 TB/s                Fast scratch space
+L1 <-> L2               ~6 TB/s                 Cache misses
+L2 <-> HBM              ~3 TB/s                 Main GPU memory
+GPU <-> GPU (NVLink)    ~900 GB/s               Multi-GPU communication
+GPU <-> CPU (PCIe)      ~64 GB/s                Host transfers (H2D/D2H)
+
+
+ACCESS SPEED HIERARCHY (FASTEST TO SLOWEST)
+-------------------------------------------
+1. Registers          (per-thread)      ~0 cycles
+2. Shared Mem / L1    (per-SM)          ~20-30 cycles
+3. L2 Cache           (per-GPU)         ~200 cycles
+4. HBM / DRAM         (per-GPU)         ~400-800 cycles
+5. NVLink             (GPU-to-GPU)      ~1000+ cycles
+6. PCIe               (GPU-to-CPU)      ~10000+ cycles
+
+
+ONE-LINER
+---------
+"Closer to SM = faster. Registers > Shared/L1 > L2 > HBM > NVLink > PCIe"

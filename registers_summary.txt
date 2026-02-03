@@ -1,0 +1,233 @@
+GPU REGISTERS - COMPLETE SUMMARY
+=================================
+
+
+1. WHAT ARE REGISTERS?
+======================
+
+    NOT this:                           THIS:
+    ---------                           -----
+    "Each thread has                    "One shared SRAM block,
+     its own box"                        partitioned among threads"
+    
+    [T0] [T1] [T2] [T3]                 +---------------------------+
+      |    |    |    |                  |   Register File (SRAM)    |
+      v    v    v    v                  |   64K slots × 32 bits     |
+    [R] [R] [R] [R]                     |   = 256 KB per SM         |
+                                        +-------------+-------------+
+                                                      |
+                                        Hardware partitions at launch
+
+
+2. REGISTER FILE STRUCTURE
+==========================
+
+    +-----------------------------------------------------------+
+    |                 SM Register File (256 KB)                 |
+    |                                                           |
+    |  64K registers = 65,536 slots of 32 bits each             |
+    |                                                           |
+    |  Partitioned at kernel launch:                            |
+    |  +---------+---------+---------+-----+---------+          |
+    |  |Thread 0 |Thread 1 |Thread 2 | ... |Thrd 2047|          |
+    |  |Slots    |Slots    |Slots    |     |Slots    |          |
+    |  |0-31     |32-63    |64-95    |     |N-N+31   |          |
+    |  +---------+---------+---------+-----+---------+          |
+    |                                                           |
+    |  Example: 32 registers/thread, 2048 threads               |
+    |  Check: 32 × 2048 = 65,536 = 64K ✓                        |
+    +-----------------------------------------------------------+
+
+
+3. WHY REGISTERS ARE FAST
+=========================
+
+    Memory Type        Location              Latency      
+    -------------------------------------------------------
+    Registers          Inside SM             ~0 cycles    
+    Shared Memory      Inside SM             20-30 cycles 
+    L2 Cache           On GPU chip           ~200 cycles  
+    HBM (DRAM)         On GPU (off-chip)     400-800 cycles
+    
+    Registers are WIRED directly to ALUs - no fetch needed!
+    
+    Instruction: ADD R3, R1, R2
+                      |
+                      v
+    +----------+    +----------+    +----------+
+    | Fetch R1 |--->|   ALU    |--->| Store R3 |
+    | Fetch R2 |--->| R1 + R2  |    |          |
+    +----------+    +----------+    +----------+
+                ALL IN ONE CYCLE (pipelined)
+
+
+4. BANKING FOR PARALLEL ACCESS
+==============================
+
+    Problem: 32 threads need registers simultaneously
+    Solution: 32 banks with independent access ports
+    
+    +-------+-------+-------+-------+-----+-------+
+    |Bank 0 |Bank 1 |Bank 2 |Bank 3 | ... |Bank 31|
+    +-------+-------+-------+-------+-----+-------+
+    |Slot 0 |Slot 1 |Slot 2 |Slot 3 |     |Slot 31|
+    |Slot 32|Slot 33|Slot 34|Slot 35|     |Slot 63|
+    |Slot 64|Slot 65|Slot 66|Slot 67|     |Slot 95|
+    |  ...  |  ...  |  ...  |  ...  |     |  ...  |
+    +---+---+---+---+---+---+---+---+-----+---+---+
+        |       |       |       |             |
+        v       v       v       v             v
+      Port 0  Port 1  Port 2  Port 3  ...  Port 31
+    
+    Bank number = Slot number % 32
+    
+    32 threads accessing 32 different banks = 1 cycle (parallel)
+    32 threads accessing same bank = 32 cycles (serialized) BAD!
+
+
+5. REGISTER LIMITS
+==================
+
+    Hardware Limits:
+    +--------------------------------+----------------+
+    | Limit                          | Value          |
+    +--------------------------------+----------------+
+    | Max registers per thread       | 255            |
+    | Total registers per SM         | 64K (65,536)   |
+    | Register size                  | 32 bits        |
+    | Total register file size       | 256 KB         |
+    +--------------------------------+----------------+
+    
+    Why 255 max?
+    - Instruction encoding uses 8 bits for register address
+    - 2^8 = 256, minus 1 reserved = 255
+
+
+6. REGISTERS VS OCCUPANCY TRADEOFF
+==================================
+
+    More registers/thread = Fewer threads fit = Lower occupancy
+    
+    Registers/Thread    Threads on SM    Warps    Occupancy
+    ----------------------------------------------------------------
+    32                  2048             64       100%
+    64                  1024             32       50%
+    128                 512              16       25%
+    255                 257              8        12.5%
+    
+    Formula: Max threads = 65,536 ÷ registers_per_thread
+
+
+7. REGISTER SPILLING
+====================
+
+    When thread needs more registers than allocated:
+    
+    Code needs: 64 registers
+    You force:  --maxrregcount=32
+    
+    +------------+          +----------------+
+    | Registers  |  SPILL   | Local Memory   |
+    | (32 slots) | -------> | (HBM - SLOW!)  |
+    +------------+          +----------------+
+         |                        |
+         | ~0 cycles              | 400-800 cycles
+         v                        v
+       FAST                     SLOW!
+    
+    Spilling = Registers overflow to slow memory = BAD
+
+
+8. BANDWIDTH CALCULATION
+========================
+
+    Storage ≠ Bandwidth!
+    
+    Storage:   64K registers = 256 KB (how much fits)
+    Bandwidth: ~TB/s (how fast we access)
+    
+    Per cycle:
+      4 schedulers × 1 instruction each
+      Each instruction: ~3 operands (2 read + 1 write)
+      Per warp: 32 threads
+      Each operand: 4 bytes
+    
+      = 4 × 3 × 32 × 4 bytes = 1.5 KB per cycle
+    
+    At 2 GHz:
+      1.5 KB × 2 billion = 3 TB/s per SM
+    
+    All 2048 threads touch registers simultaneously = HIGH bandwidth
+
+
+9. KEY MENTAL MODELS
+====================
+
+    Thread:
+      "A sequence of instructions with an ASSIGNED partition 
+       in the shared register file"
+    
+    Register file:
+      "One big SRAM with 32 doors (banks). 
+       Each thread knows which slots are theirs."
+    
+    Zero latency:
+      "Registers are flip-flops wired to ALUs. 
+       No memory fetch - values already there."
+    
+    Banking:
+      "32 parallel access ports. 32 threads, 32 doors = 
+       all enter at once. Same door = wait in line."
+    
+    Spilling:
+      "Overflow to slow memory. Every spill = 
+       hundreds of wasted cycles."
+
+
+10. DECISION FLOWCHART
+======================
+
+    START: How many registers does my kernel need?
+                          |
+                          v
+            +-------------+-------------+
+            | Compile with -v flag      |
+            | nvcc --ptxas-options=-v   |
+            +-------------+-------------+
+                          |
+                          v
+                   Registers/thread
+                          |
+          +---------------+---------------+
+          |               |               |
+          v               v               v
+        <32             32-64           >64
+          |               |               |
+          v               v               v
+      High             Good            Low
+      occupancy        balance         occupancy
+          |               |               |
+          v               v               v
+      Maybe too        Usually         Consider:
+      simple?          optimal         - Simplify code
+                                       - Accept low occupancy
+                                       - Check for spilling
+
+
+MNEMONICS
+=========
+
+"64K-255-32"
+  - 64K total registers per SM
+  - 255 max per thread
+  - 32 banks for parallel access
+
+"Spill = Kill"
+  - Register spilling kills performance
+
+"Storage ≠ Speed"
+  - 256 KB storage, TB/s bandwidth (parallel access)
+
+"Banking = Parking"
+  - 32 parking spots (banks), 32 cars (threads)
+  - Same spot = wait, different spots = all park at once

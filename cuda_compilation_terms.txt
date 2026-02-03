@@ -1,0 +1,45 @@
+CUDA COMPILATION FORMATS
+========================
+
+Format      Speed                              Portability
+------------------------------------------------------------------------
+PTX         Slower first run (JIT to SASS)     Works on future GPUs
+SASS/cubin  Fast (pre-compiled)                Only target architecture
+fatbin      Fast + portable                    Best of both worlds
+
+
+TERM DEFINITIONS
+----------------
+
+Term        What It Is
+------------------------------------------------------------------------
+PTX         Portable intermediate code, JIT-compiled by driver at runtime
+SASS        Actual GPU machine code for specific architecture
+cubin       Binary file containing SASS for ONE architecture
+fatbin      Bundle of multiple cubins + PTX for multiple architectures
+
+
+ARCHITECTURE TARGETS
+--------------------
+
+Target        Meaning
+------------------------------------------------------------------------
+sm_90         Hopper SASS (specific binary)
+sm_100        Blackwell SASS (specific binary)
+compute_90    PTX for Hopper+ (portable, JIT-compiled)
+sm_100f       Blackwell family-specific only
+
+
+FATBIN STRATEGY (RECOMMENDED)
+-----------------------------
+
+fatbin contents:
+  - cubin for sm_90 (Hopper)      --> Runs optimized on Hopper
+  - cubin for sm_100 (Blackwell)  --> Runs optimized on Blackwell
+  - PTX for compute_90            --> JIT-compiles on FUTURE GPUs
+
+
+MNEMONIC
+--------
+
+"PTX = Portable, SASS = Specific, fatbin = ship both"

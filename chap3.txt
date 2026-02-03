@@ -1,0 +1,396 @@
+- You want to minimize latency, maximize throughput, and ensure your GPUs are constantly fed with data and operating at their peak performance. 
+- OS: Ubuntu server/redhat linux, make sure the OS doesn't mess with GPU's, disable memory swapping. 
+- Triton: OpenAI python based cuda kernels.
+- Forward compatibility: CUDA compiler PTX code that will work with newer GPU architectures and device code that works with the current architecture. 
+- PTX for running on future architectures, SASS for current architecture --> Their combo is fatbinary. 
+- Python libs: cuTile(for tiling based matrix ops), cupynumeric(direct replacement for numpy on GPU).
+- Pytorch stack: TorchDynamo, AOIT Autograd, and a backend like TOrchInductor or Accleerated Linear Algebra(XLA)
+- Configuring CPUs and OS for GPU Environments: 
+
+- In an AI system, the job of CPU is to prepare the next batch of data, including loading the data from disk, tokenizing the data, transforming it, dispatching GPU kernels, and coordinating between threads and processes. 
+- NUMA awareness and CPU pinning: 
+    - A NUMA node is a logical grouping of CPUs, GPUs, network interface controllers, and memory that are physically close to one another. 
+    - Access withn a NUMA node is faster than access across NUMA nodes.
+- CPU to GPU transfer speed: 900 GB/server
+- KI: Keep CPU execution and memory access local to the GPU that it is serving. 
+- Funda: GPU's are on a NUMA node -- CPU pinning -- make sure the CPU threads feeding data are on the same NUMA node as the GPU(be careful in hierarchical dataloader functions that the numa affinity is propagated well)
+- CPU pinning also avoids unnecessary threads being assigned other numa nodes -> reduce perf. jitter and variance. 
+
+- Previously, CPU-GPU data trasnfer was a problem. But now, in Grace Blackwell GPU's, CPU and GPU expose a coherent shared virtual address space over NVLINK-C2C, while CPU DRAM and GPU HBM remain distinct memory pools. 
+- What's the data transfer speed between CPU and GPU in Grace Blackwell? 900 GB/s
+
+NUMA-Friendly Memory Allocation and Memory Pinning: 
+- CPU affinity doesn't gaurantee that memory allocations are local to the NUMA node for a particular process. 
+- Keep memory close to the CPU, which is close to the GPU. 
+- numactl --cpunodebind=1 --membind=1 python train.py --gpu 5 &
+- If the python script forks subprocesses, they will inherit the NUMA memory binding of the parent process. 
+- But if you instead spawn start/ exec a new program, those child processes do not inherit the parent's memory policy. 
+- Pinned memory -- page locked memory -- H2c data copy is 2-3x faster than pageable memory due to DIRECT MEMORY ACCESS. 
+
+- Rule: Pytorch Dataloader pin_memory=True (10-20% speedup in data transfer to GPU)
+- Rule: GPUDirect RDMA and GDS should be enabled for low latency data transfer
+- There is a limit for large, pinned buffers -- set it to high
+
+Transparent Hugepages: 
+- Linux memory management typically uses 4KB pages but DL apps play with GB's of memory 
+- THP: 2 MB - 1 GB pages 
+- THP: Gains of 3-5% throughput improvement by reducing page-fault overhead and TLB pressure. 
+- Rule: Enable THP during training, disable THP during inference (compaction has some latency overhead)
+
+1️⃣ Page = Fixed-Size Memory Block
+ - RAM is divided into fixed chunks called pages (typically 4KB)
+ - Makes memory management clean and predictable
+ - Each program gets its own "virtual pages" mapped to "physical pages" in actual RAM
+2️⃣ Page Table = Virtual → Physical Address Dictionary
+ - Every program has a page table
+ - Translates: "Program wants address X" → "Actual RAM location Y"
+ - TLB = fast cache for recent translations (TLB miss = slow lookup in RAM)
+3️⃣ Huge Pages = Bigger Blocks, Smaller Page Table
+ - Regular: 4KB pages → many entries (262K entries for 1GB)
+ - Huge: 2MB or 1GB pages → few entries (512 or 1 entry for 1GB)
+ - Fewer entries = more TLB hits = faster memory access
+ - Trade-off: Need contiguous physical RAM, harder to allocate
+4️⃣ Training: Huge Pages = ✅ Good
+ - Allocate large memory once at startup
+ - Reuse for hours/days → allocation cost amortized
+ - TLB benefits compound over millions of iterations
+ - Throughput > latency
+5️⃣ Inference: Huge Pages (THP) = ❌ Often Disable
+ - Frequent, short-lived allocations
+ - Huge page creation is slow (10-100ms) → latency spikes
+ - TLB benefit used once then discarded → not worth the cost
+ - Disable THP: echo never > /sys/kernel/mm/transparent_hugepage/enabled
+
+Memory trick: "Training = long movie, buy popcorn once. Inference = many short clips, don't wait in line each time." 🍿
+
+Scheduler and Interrupt Affinity:
+- For latency sensitive apps, use real-time FIFO/RR prioritiy scheduling. 
+- Even interrupt should be pinned to a core on a NUMA node so that other NUMA nodes don't get interrupted due to one node's interrupt.
+- Isolate cores/create separate CPU partitions to reduce interruptions on dedicated resources. 
+- Disable irqbalance dameon / run it with bespoke rules. 
+
+Virtual Memory and Swapping:
+- Swapping-> increases latency -> disable it explicity using vm.swappiness = 0
+
+Filesystem Caching and Write-Back: Leveraging cache for faster storage of checkpoints. 
+- CPU Frequency and C-States: Set CPU governor to performance mode using cpupower frequency -set -g performance 
+- CPU enters C-states to save power when idle -> increases latency -> disable C-states in BIOS/UEFI.
+- Bubbles: Periods of time when the GPU is waiting for the CPU to resume data processing. 
+
+- Turn off stuff that produces unpredictable latency on CPU: 
+    - Excess context switching
+    - CPU frequency scaling
+    - Memory-to-disk swapping 
+- Goal is to deliver data from CPU to GPU as fast as possible with minimal interventions from the OS. 
+- Tune Host CPU Memory Allocator: You need to make sure CPU is not a bottleneck when feeding data to GPU. 
+- Default memory allocator in Linux is not optimized for low latency and high throughput.
+    - With jemalloc
+        - you can shard allocations into per-CPU arenas
+        - enable background_thread for off-path purging
+        - lengthen dirty_decay_ms/muzzy_decay_ms so that freed pages aren't immediately returned to the OS.
+    - With tcmalloc
+        - tune the TCMALLOC_MAX_TOTAL_THREAD_CACHE_BYTES and TCMALLOC_RELEASE_RATE environment variables
+        - These will provide larger per-thread caches so that small allocations avoid global locks and syscalls
+
+================================================================================
+DEEP DIVE: CPU/Memory Architecture Concepts
+================================================================================
+
+📦 CPU Chip Hierarchy:
+┌─────────────────────────────────────────────────────────────────┐
+│                CPU CHIP (Package/Socket)                        │
+│  ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐              │
+│  │ Core 0  │ │ Core 1  │ │ Core 2  │ │ Core 3  │  ...         │
+│  │ L1/L2   │ │ L1/L2   │ │ L1/L2   │ │ L1/L2   │              │
+│  └────┬────┘ └────┬────┘ └────┬────┘ └────┬────┘              │
+│       └──────────┬┴──────────┬┴──────────┘                     │
+│                  ▼ Shared L3 Cache ▼                           │
+│                  └──────┬───────────┘                          │
+│                         ▼ Memory Controller → RAM              │
+└─────────────────────────────────────────────────────────────────┘
+- CPU Chip/Package = physical silicon you plug into motherboard
+- Core = independent execution unit (the actual "CPU")
+- Thread (Hyperthread) = virtual core; 2 threads share 1 physical core
+- Logical CPU = what OS sees (cores × threads per core)
+- Example: 96-core chip with 2 threads/core = 192 logical CPUs
+
+🏘️ NUMA Node = "A Neighborhood" (Think: Separate Computer):
+┌─────────────────────────────┐     ┌─────────────────────────────┐
+│       NUMA Node 0           │     │       NUMA Node 1           │
+│  ┌─────────────────────┐    │     │  ┌─────────────────────┐    │
+│  │ CPU Chip (Socket 0) │    │     │  │ CPU Chip (Socket 1) │    │
+│  │ Cores 0-15          │    │     │  │ Cores 16-31         │    │
+│  └─────────┬───────────┘    │     │  └─────────┬───────────┘    │
+│            ▼                │     │            ▼                │
+│  ┌─────────────────────┐    │     │  ┌─────────────────────┐    │
+│  │ Local RAM (128GB)   │    │ ◄──►│  │ Local RAM (128GB)   │    │
+│  └─────────────────────┘    │SLOW │  └─────────────────────┘    │
+│  ┌───────┐ ┌───────┐        │LINK │  ┌───────┐ ┌───────┐        │
+│  │ GPU 0 │ │ NIC 0 │        │     │  │ GPU 1 │ │ NIC 1 │        │
+│  └───────┘ └───────┘        │     │  └───────┘ └───────┘        │
+└─────────────────────────────┘     └─────────────────────────────┘
+- NUMA = Non-Uniform Memory Access (not all RAM is equally fast)
+- NUMA Node = Socket + its local RAM + local devices
+- Intra-NUMA (local): ~100ns, fast ✓
+- Inter-NUMA (remote): ~200ns, slow ✗ (crosses interconnect)
+- L3 cache is shared WITHIN a NUMA node → fast core-to-core communication
+
+🔒 Cache Coherency & False Sharing:
+- Caches work in 64-byte "cache lines", not individual bytes
+- MESI protocol keeps caches consistent across cores
+- FALSE SHARING: Different variables on SAME cache line → unnecessary invalidation
+
+  Single Arena (Bad - False Sharing):
+  Cache Line: [Core0_var│Core1_var│Core2_var│Core3_var]
+              All cores fight over same cache line! 💥
+
+  Per-CPU Arenas (Good - No False Sharing):
+  Line 0x1000: [Core0_var│........]  ← Core 0's arena
+  Line 0x5000: [Core1_var│........]  ← Core 1's arena
+              Different cache lines, no conflict! ✓
+
+🏟️ What is an Arena? (Software, Not Hardware!):
+- Arena = allocator's internal bookkeeping structure
+- Tracks: free list, used list, lock
+- Single arena: all threads share one lock → contention
+- Per-CPU arenas: each core has own arena → no lock contention
+
+  Single Arena:                    Per-CPU Arenas:
+  Thread 0 ──┐                     Core 0 ──► [Arena 0] 🔒
+  Thread 1 ──┼──► [Arena] 🔒       Core 1 ──► [Arena 1] 🔒
+  Thread 2 ──┤    (contention!)    Core 2 ──► [Arena 2] 🔒
+  Thread 3 ──┘                     (parallel, no waiting!)
+
+🔧 jemalloc Optimizations Explained:
+┌─────────────────────────────────────────────────────────────────┐
+│ 1. Per-CPU Arenas: Each core has own memory pool               │
+│    → No lock contention, no false sharing                       │
+│                                                                 │
+│ 2. background_thread=true: Cleanup happens async                │
+│    Without: App thread stops to purge memory (latency spike!)  │
+│    With:    Background thread purges, app continues            │
+│                                                                 │
+│ 3. dirty_decay_ms / muzzy_decay_ms: Delay returning pages to OS│
+│    Problem: Free 10MB → return to OS → need 10MB → ask OS again│
+│    Solution: Keep freed pages for 10-30 seconds for reuse      │
+│             → No syscalls, instant reallocation!               │
+└─────────────────────────────────────────────────────────────────┘
+Usage: LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so \
+       MALLOC_CONF="background_thread:true,dirty_decay_ms:10000,muzzy_decay_ms:30000" \
+       python train.py
+
+================================================================================ 
+
+- GPU Driver and Runtime Settings for Performance: 
+
+- GPU Persistence Mode: Run nvidia-persistenced to keep the GPU driver loaded even when no applications are running-> zero startup delay for the next job. 
+- TO enable persistenced dameon at boot: systemctl enable nvidia-persistenced
+
+MPS: Multiple python processes can share and use a single GPU simultaneously. 
+- Run an MPS dameon server on each GPU: nvidia-cuda-mps-control -d
+- MPS partitions GPU compute but not GPU memory. 
+- All MPS clients must run as the same Unix user --> Modern NVIDIA drivers support multiuser MPS so that processes from different Unix users can share a single MPS server. 
+
+MIG: Multi-Instance GPU
+- MIG allows a single physical GPU to be partitioned into multiple(7) instances, each with its own dedicated resources (compute cores, memory, bandwidth). 
+- Division of GPU is fixed for each version of GPU in terms of compute, memory, cache, no. of instances, etc. 
+- When MIG is ON, GPU-GPU comms are off in terms of NVLInk, PCIe P2P. 
+
+GPU Clock Speeds and ECC:
+- You can set GPU clock speeds using nvidia-smi -ac <mem clock>,<graphics clock> --> for benchmarking, leaving at default for normal training/inference is recommended.
+- ECC: Error Correcting Code memory -> detects and corrects single-bit memory errors -> slight performance overhead -> recommended to keep ON
+
+1/15/26:
+- No GPU swap memory -> crash when try to allocate more memory than available. 
+- Mitigation: Allow memory to grow dynamically, embrace uniified memory across CPU and GPU, utilize memory pools and caching allocators. 
+- Tensorflow --> takes in all GPU memory by default to avoid fragmentation; pytorch --> allocates memory as needed but doesn't release it back to OS.
+- PME: Page Migration Engine -> moves memory pages between CPU and GPU based on access patterns -- allows for oversubscription of GPU memory coz its proxying GPU memory on CPU memory --> CPU bandwidth isi slower than GPU memory bandwidth -> performance hit if overused.
+- If you run into GPU OOM error, likely due to memory fragmentation/excessive memory caching - clear cache using PyTorch's torch.cuda.empyt_cache()
+- Always try to keep the driver loaded on GPU, basically, keep the driver and any MIG configuration persistent across jobs. 
+
+- A container is not VM -->can give bare metal performance if configured properly. With NVIDIA Container Toolkit, GPU access from within a Docker container is direct and does not incur overhead. 
+- Container have CUDA versions that require the host driver to be >= a minimum version.
+- Containers can use the driver libraries from the host OS directly, so you don't need to install the GPU driver inside the container
+- Important that CUDA and driver versions are compatible. 
+- Docker + NVIDIA = Bare-metal performance --> no virtualization overhead.
+
+Goal: Learn in a flow, not in a rush --> develop understanding. 
+
+- Main diff. host OS and Docker container --> I/O --> container use union file system  = host + container filesystems --> latency 
+- Why? Lookup: CoW: Copy on Write --> when container write to a file, it creates a copy of the file in the container layer --> extra overhead.
+- FIX: Use bind mounts to map host directories into container directly --> lower latency.
+
+- Daemon: Background process that runs forever. 
+
+         Docker                    Singularity
+         ──────                    ───────────
+           │                            │
+           ▼                            ▼
+    ┌─────────────┐              ┌─────────────┐
+    │ ROOT Daemon │              │  No daemon! │
+    │     🔱      │              │     👤      │
+    └──────┬──────┘              └──────┬──────┘
+           │                            │
+           ▼                            ▼
+    [Container]                  [Container]
+    
+    ❌ HPC: "Too risky!"         ✅ HPC: "Welcome!"
+
+- Reduce image size for faster startup times
+- Singularity/Apptainer runs images in user space while docker needs root daemon
+- Very little overhead when running on a container instead of directly on the host. 
+
+- Kubernetes(K8s)- container orchestrator 
+- NVIDIA plugin exposes GPU resources to the Kubernetes scheduler(assigns pods to nodes with available GPU resources)
+- Pod = "A box with an IP address that runs your container(s)" 📦🏷️
+
+│   NVIDIA GPU Operator = "GPU setup guy for Kubernetes"        │
+│                                                                 │
+│   Installs & manages EVERYTHING needed for K8s ↔ GPU:         │
+│                                                                 │
+│   ✓ Drivers                                                    │
+│   ✓ Device plugin (tells scheduler about GPUs)                │
+│   ✓ Container toolkit (lets containers use GPUs)              │
+│   ✓ Labels (NUMA node, NVLink info)                           │
+│   ✓ Monitoring (DCGM)                                          │
+
+GPU Operator prepares everything for Kubernetes to talk functionally to the GPU
+
+- By default, Kubertes is not topology aware --> may allocate GPU's across NUMA nodes --> perf. hit. --> IntraGPU comms in a single NUMA node is faster than inter-NUMA node comms due to NVLink locality.
+- Fix: Use Kubernetes Topoplogy Manager component -- aware of NUMA topology when scheduling pods --> STILL EVOLVING
+- For training, make sure you enable topology aware scheduling --> configure --topology-manager-policy to best-effort, restricted, single-numa-node
+- Latest NVIDIA GPU device plugin, NVIDIA Kubernetes GPU Operator --> are topolgy aware and support packing multi-GPU pods onto GPU's that are connected ot the same NUMA Node. 
+- While scheduling collective-heavy training, prefer placements that keep traffic inside the fast NVLink domain before crossing the slower network fabric. 
+
+Data Center
+└── Racks (cabinets)
+    └── Servers (physical machines)
+        └── NUMA Nodes (CPU socket + local RAM + local devices)
+            └── GPUs (connected via NVLink within server)
+- 1 GPU in 1 NUMA node can talk to another GPU in another NUMA node using NVLINK due to NVSwitch
+- With NVSwitch(only within a single server, GEN2), intra node GPU-GPU comms is equal to inter-node GPU-GPU comms.
+- GEN3: NVLink Network(NVL72) -> GPU<->GPU comms across servers in a rack equal to intra-node GPU-GPU comms speed. 
+
+│   GPU ←──1.8 TB/s──→ NVLink Network ←──1.8 TB/s──→ GPU        │
+│                                                                 │
+│   Every GPU has 1.8 TB/s of "on-ramp" to the network          │
+│   72 GPUs = 130 TB/s total combined throughput                 │
+
+- So, 1 single rack can move 130 TB/s of data from it
+
+Job Scheduling with Kubernetes and SLURM:
+- SLURM: Simple Linux Utility for Resource Management -- for multi node job scheduling during training 
+- Kubernetes: container orchestration -- for multi node job scheduling during inference
+- Slinky : SLURM + K8s hybrid scheduler for training and inference workloads in a unified cluster.
+- There are ways to get optimal GPU resources in terms of NUMA locality and NVLink topology --> get it right!
+
+- Scheduler cannot MIG slice a GPU -- has to be configured prior to scheduling(requires node reboot), NVIDIA Kubernetes GPU OPerator's MIG Manager has something to do here 
+- A single kubernetes pod cannot run on multiple nodes but can run on multiple MIG slices within a single node. 
+- GPU has to be in persistence mode for MIG so that when the GPU is out of job, the MIG config is persistent.
+
+Optimizing Network Communication for Kubernetes:
+- Pod<->Pod comms in K8's is bad by default --> but you can let it use host networking using hostNetwork: true in the pod spec
+- Okay, K8 node is different from NUMA node --> K8 node = physical server with multiple NUMA nodes(1 K8 node = 1 server)
+- So, within a K8 node, you can have multiple NUMA nodes --> make sure that the pod is scheduled on a K8 node with NUMA topology awareness so that intra-NUMA node GPU-GPU comms is preferred. 
+- So, Pod<->Pod comms should essentially be viewed as Server<->Server comms --> before NVL72 slow, but at NVLINK speed with NVL72.
+- If host networking is not possible, try to put as much as possible of network overlay on kernel space -- crush all user space proxies. 
+- For RDMA, use Kubernetes RDMA device plugin
+- If you have InfiniBand or RoCE networking, enable GPUDirect RDMA for low latency data transfer between GPU and network interface controller bypassing the CPU.
+
+Old way (CPU bottleneck):
+┌─────┐      ┌─────┐      ┌─────┐      ┌─────┐
+│ GPU │ ──── │ CPU │ ──── │ NIC │ ──── │Wire │
+└─────┘      └─────┘      └─────┘      └─────┘
+             ↑ Busy! ↑
+
+New way (RDMA, CPU bypassed for data):
+┌─────┐                   ┌─────┐      ┌─────┐
+│ GPU │ ─────────────────│ NIC │ ──── │Wire │
+└─────┘  GPUDirect RDMA  └─────┘      └─────┘
+
+┌─────┐
+│ CPU │  "I just set things up, then I chill" 😎
+└─────┘
+
+- Training or Inference alone on a GPU is easier to debug than mixed workloads.
+- BP: Reserve CPU resources for your pod using K8 CPU isolation which ensures that pods get the dedicated CPU cores and memory they request - and prevent other pods from being scheduled on the same CPU core as yours. 
+- You have to reserve CPU and GPU at any cost for best utilization. 
+
+┌─────────────────────────────────────────────────────────────────┐
+│                                                                 │
+│   JOB (Kubernetes object)                                      │
+│   │                                                            │
+│   └── POD (one or more)                                        │
+│       │                                                        │
+│       └── CONTAINER (one or more)                              │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+
+Job > Pod > Container
+
+┌─────────────────────────────────────────────────────────────────┐
+│                                                                 │
+│  CONTAINER = Single running process                            │
+│              (your Python training script, for example)        │
+│                                                                 │
+│  POD       = Wrapper around 1+ containers                      │
+│              (has IP address, shared storage)                  │
+│                                                                 │
+│  JOB       = Kubernetes object that manages pods               │
+│              "Run this pod until it completes successfully"    │
+│              (handles retries, parallelism, completion)        │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+- Linux OOM kills 1 pod → other pods lose connection, wait, timeout, crash → entire job fails.
+- If 2 pods exist, one yours(good), 2 greedy: Greedy container causes OOM → Linux unfairly kills YOUR pod(due to how linux OOM is) → Your whole job fails -- see above point. 
+- One way --> don't set memory limits on your pod/container / set a higher than required memory limit. 
+
+│                    THREE QoS CLASSES                            │
+│              (Who gets killed first when resources tight?)      │
+│                                                                 │
+│   BestEffort  →  Burstable  →  Guaranteed                      │
+│   (killed 1st)   (killed 2nd)  (killed last)                   │
+│       💀              ⚠️            ✓                          │
+
+
+- In Kubernetes, a Pod with no requests/limits is treated as BestEffort and is the most likely to be evicted. To obtain Guaranteed
+QoS, every container must set requests == limits for both CPU and memory. Setting a high limit alone will result in a Burstable
+QoS, not Guaranteed.
+
+- Set request == limit at your ACTUAL needs → Guaranteed QoS → Last to die ✓
+
+- Different QoS(Quality of Service) classes = Clear order (BestEffort → Burstable → Guaranteed)
+- Same QoS class = Still random among them!
+
+1/19/26
+┌─────────────────────────────────────────────────────────────────┐
+│                         NODE                                    │
+│                                                                 │
+│   Pod A    Pod B    Pod C    Pod D                             │
+│     │        │        │        │                                │
+│     └────────┴────────┴────────┘                                │
+│                   │                                             │
+│                   ▼                                             │
+│   ┌─────────────────────────────────────────────────────────┐  │
+│   │              SHARED DISK (SSD/NVMe)                     │  │
+│   │              Bandwidth: 10 GB/s total                   │  │
+│   │                                                         │  │
+│   │   All pods fight for this single pipe! 🤜💥🤛          │  │
+│   └─────────────────────────────────────────────────────────┘  │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+
+I/O = Input/Output = Reading/Writing to disk/storage
+I/O Isolation = Preventing one pod from hogging all the disk bandwidth and slowing others down
+
+- K8 doesn't have built-in I/O isolation → all pods share same disk bandwidth -- need manual tuning 
+
+Shared disk = One bathroom 🚽
+
+Pod B: Takes 20-minute shower (checkpointing)
+Pod A: "I just need to brush my teeth!" (load data)
+       Has to wait... GPU sitting idle... 💸
+
+With I/O isolation: Two bathrooms! Everyone gets fair access.
+- Need to revisit the things said here --> I didn't get real good understanding/practice of stuff here. 
+

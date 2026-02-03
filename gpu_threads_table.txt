@@ -1,0 +1,49 @@
+GPU THREAD HIERARCHY - QUICK REFERENCE
+======================================
+
+FIXED HARDWARE LIMITS
+---------------------
+Limit                   What It Means                              Example (Ampere)
+---------------------------------------------------------------------------------------
+Threads per warp        Threads that execute in lockstep           Always 32 (fixed)
+Threads per SM          Max threads resident (loaded/ready)        2048
+Warps per SM            = Threads per SM / 32                      64 warps
+Schedulers per SM       Warps that can issue instructions/cycle    4
+
+
+BLOCK SIZE IMPACT
+-----------------
+Block Size    Warps/Block    Blocks that fit on SM (2048 threads max)
+---------------------------------------------------------------------
+64            2              32 blocks
+128           4              16 blocks
+256           8              8 blocks
+512           16             4 blocks
+1024          32             2 blocks
+
+
+KEY CONCEPTS
+------------
+Term              Definition
+---------------------------------------------------------------------------------------
+Warp              32 threads, 1 instruction pointer, execute in lockstep
+Block             Group of threads (you choose size), shares shared memory
+SM                Streaming Multiprocessor, runs multiple blocks/warps
+Occupancy         Ratio of active warps to max possible warps on SM
+Resident          Loaded on SM, ready to run (not necessarily running NOW)
+
+
+RULES OF THUMB
+--------------
+1. Block size = multiple of 32 (avoid wasted warp slots)
+2. Common good sizes: 128, 256, 512
+3. Too big block = register pressure = spilling = slow
+4. Too small block = not enough warps = can't hide latency
+
+
+MNEMONIC: "32-WARP-BLOCK-SM"
+----------------------------
+- 32 threads per warp (fixed)
+- WARP = lockstep execution unit
+- BLOCK size you choose (multiple of 32)
+- SM holds many warps to hide latency

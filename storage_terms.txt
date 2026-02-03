@@ -1,0 +1,19 @@
++-------------+--------------------------------------+-----------------------------------------------+
+| Term        | What It Is                           | Why It Matters for AI                         |
++-------------+--------------------------------------+-----------------------------------------------+
+| XFS         | High-performance filesystem          | Handles large files + parallel I/O well       |
+| NVMe        | Fast SSD protocol (PCIe)             | 10-100x faster than SATA SSD                  |
+| noatime     | Skip access-time writes              | Eliminates write-per-read overhead            |
+| Bursting    | Variable throughput (credit-based)   | Bad for sustained training (credits deplete)  |
+| Provisioned | Fixed guaranteed throughput          | Predictable, no surprises                     |
+| Max I/O     | High aggregate IOPS mode             | Better for parallel AI workloads              |
++-------------+--------------------------------------+-----------------------------------------------+
+
+Mnemonics:
+- "XFS for eXtra Fast Storage" - Use XFS for large AI datasets, not ext4
+- "noatime = no wasted writes" - Every read doesn't need a timestamp write
+- "Bursting = borrowing, Provisioned = owning" - Bursting runs out, provisioned is guaranteed
+- "Max I/O for max parallelism" - Many workers reading simultaneously? Use Max I/O mode
+
+All-in-one:
+"XFS + noatime + Provisioned + Max I/O = AI storage happy path"

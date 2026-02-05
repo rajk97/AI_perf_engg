@@ -1,3 +1,417 @@
+GPU Architecture, CUDA Programming, and Maximizing Occupancy:
+- Main goal: Review Single Instruction Multiple-Threads SIMT execution model and how warps, thread blocks, and grids map your GPU-based algorithms onto streaming multiprocessors(SMs).
+- CUDA programming patterns, on-chip memory hierarchy, and demonstrate the GPUs asynchronous data transfer capabilities, including the Tensor Memory Accelerator(TMA) and the Tensor Mmeory(TMEM) that serves as teh accumulatoor for the Tensor Core operations. 
+- CPUs: Optimize for single-threaded low-latency performance, 
+- GPUs: Throughput-optimized processors built to run thousands of threads in parallel. 
+
+- Streaming MultiProcessors: Analogous to CPU cores but streamlined for parallelism. 
+- Each SM can track up to 64 warps(32 thread grouops) on Blackwell. 
+
+┌─────────────────────────────────────────────────────────┐
+│                 ONE SM (Blackwell)                      │
+├─────────────────────────────────────────────────────────┤
+│                                                         │
+│   64 warps × 32 threads = 2048 threads                 │
+│   ──────────────────────                                │
+│                                                         │
+│   64K registers (256 KB)                                │
+│   ────────────────────────                              │
+│                                                         │
+│   256 KB shared SRAM (L1 + shared memory)              │
+│   ───────────────────────────────────────               │
+│        └── 227 KB usable as shared memory              │
+│                                                         │
+└─────────────────────────────────────────────────────────┘
+
+256 KB SRAM per SM
+┌─────────────────────────────────────────┐
+│                                         │
+│  ┌─────────────────────────────────┐   │
+│  │     Shared Memory(All threads in a thread block access it -> 20x faster than HBM memory)              │   │
+│  │     (up to 227 KB usable)       │   │  ← You control this
+│  └─────────────────────────────────┘   │
+│                                         │
+│  ┌─────────────────────────────────┐   │
+│  │     L1 Cache                    │   │  ← Hardware manages
+│  │     (remaining portion)         │   │
+│  └─────────────────────────────────┘   │
+│                                         │
+│  ┌─────┐                               │
+│  │ 1KB │ Reserved by CUDA              │
+│  └─────┘                               │
+│                                         │
+└─────────────────────────────────────────┘
+
+Per cycle, SM can issue:
+
+4 schedulers × 1 warp each × 2 instructions = 8 instructions max
+     │              │              │
+     │              │              └── NOT "memory ops"
+     │              │                  Could be: 1 math + 1 memory
+     │              │                           1 math + 1 math (diff type)
+     │              │
+     │              └── Each scheduler picks 1 warp (32 threads)
+     │
+     └── 4 independent schedulers
+
+So: 4 warps active × 32 threads = 128 threads issuing per cycle
+    (out of 2048 resident threads)
+
+Each SM has 4 warp schedulers --> That means in each cycle, 4 warps can be executed. But the warp execution can contain 2 different instructions like 1 math + 1 memory(dual-issue - must be from the same warp), etc.
+- If all the warps correspond to a single kernel, why do we have different instructions at all among threads from different warps? 
+- Coz of latency, the warps fall out of sync. 
+
+- Blackwell SMs contain four independent warp schedulers, each capable of issuing one warp instruction per cycle with dual-issue of one math and one memory per scheduler. 
+- Issue: Dispatch an instruction to the hardware that executes it 
+
+"Issue" = Dispatch an instruction to the hardware that executes it
+
+┌─────────────────┐         ┌─────────────────┐
+│  Warp Scheduler │  ISSUE  │ Execution Unit  │
+│                 │ ──────► │ (does the work) │
+│  "Run this ADD" │         │                 │
+└─────────────────┘         └─────────────────┘
+                               ALU, Tensor Core,
+                               Load/Store Unit, etc.
+
+INSTRUCTION LIFECYCLE:
+══════════════════════
+
+1. FETCH     Get instruction from memory
+                │
+                ▼
+2. DECODE    Figure out what it means (ADD? LOAD? MUL?)
+                │
+                ▼
+3. ISSUE  ►  Send to the right execution unit    ◄── THIS IS "ISSUE"
+                │
+                ▼
+4. EXECUTE   Hardware does the actual math/memory op
+                │
+                ▼
+5. WRITEBACK Store the result
+
+Scheduler's job:
+════════════════
+
+┌────────────────────────────────────────────────────────────────┐
+│                     WARP SCHEDULER                             │
+│                                                                │
+│  1. Look at ready warps: "Who's not stalled?"                  │
+│                                                                │
+│  2. Pick one warp                                              │
+│                                                                │
+│  3. Look at its next instruction(s)                            │
+│                                                                │
+│  4. ISSUE = Send instruction(s) to execution pipelines         │
+│                                                                │
+└───────────────────────────┬────────────────────────────────────┘
+                            │
+            ┌───────────────┼───────────────┐
+            │               │               │
+            ▼               ▼               ▼
+       ┌────────┐      ┌────────┐      ┌────────┐
+       │  ALU   │      │ Tensor │      │ Load/  │
+       │        │      │  Core  │      │ Store  │
+       └────────┘      └────────┘      └────────┘
+       
+       Execution units that DO the work
+- Dual Issue: 1 Arithmetic + 1 Memory instruction --> Not two different INT32/FP32 Arithmetic instructions. 
+- Apparently, in Volta+, instead of 1 arthmetic+1 memory, we can do 1 INT32 Arithmetic + 1 FP32 Arithmetic and it will work 
+
+- Per SM: 
+N Schedulers -> 4
+Max. warps issued -> 4(1 per scheduler)
+Max. math ops -> 4(1 per scheduler's arithmetic issue)
+Max. memory ops -> 4(1 per scheduler's load/store issue)
+
+- So, best case you do 4 math and 4 memory ops per cycle on the SM 
+
+- SFU (Special Function Unit): Handles slow transcendental ops (sin, cos, sqrt, reciprocal) on a separate pipeline. While SFU executes over multiple cycles, the scheduler hides latency by switching to other warps for dual-issue math+memory — it's parallel through latency hiding, not triple-issue.
+
+- There is some trickery to memory load/store-> say a scheduler issued a memory load/store --> that means 1 warp should load different addresses --> 32 memory load/store ops. 
+- Here comes the tricky part, even though requirement is 32 mem ld/st's, the hardware per scheduler only has 4 pipelines(hard wiring that's moving data from RAM, etc.) --> 1 cycle - only 4 mem ld/st's happen --> for 32 mem ld/st's, 8 cycles are needed. 
+- Dual issue --> Even though arithmetic + mem ops are dual-issued, arithmetic happens fast as it takes ~1 cycle while the mem ops take 8 cycles 
+- If its 8 cycles --> how to reduce? 1. Coalesced memory -> if the access is kinda sequential --> get cache lines --> will take lower no. of cycles
+
+Memory LD/ST Mechanics:
+═══════════════════════
+- 1 warp issues LOAD → 32 threads each need their own address (normal — parallelism!)
+- Hardware: only 4 LD/ST pipelines per scheduler
+- Naive: 32 addresses ÷ 4 pipelines = 8 cycles minimum
+
+Why Arithmetic is Faster:
+- Blackwell: 32 FP32/INT32 units → all 32 threads complete in 1 cycle
+- Dual-issue: math finishes fast, memory takes 8+ cycles (overlap via warp switching)
+
+Coalesced Memory (the optimization):
+- If 32 threads access CONSECUTIVE addresses → all fit in 1-2 cache lines(Address Coalescing Unit senses it and issues 1 mem request that get's loaded into L1/L2 cache)
+- Hardware fetches cache line once → distributes to all 32 threads
+- Result: 1-2 transactions instead of 32 → approaches 1 cycle
+
+HOW COALESCED ACCESS ACTUALLY WORKS:
+════════════════════════════════════
+
+STEP 1: Scheduler collects all 32 addresses
+─────────────────────────────────────────────
+Thread 0:  0x1000
+Thread 1:  0x1004
+Thread 2:  0x1008
+...
+Thread 31: 0x107C
+
+Hardware: "These all map to cache line starting at 0x1000!"
+
+
+STEP 2: ONE request to memory system (not 32)
+─────────────────────────────────────────────
+
+┌────────────────────────────────────────────────────────────┐
+│   Address Coalescing Unit (before pipelines)               │
+│                                                            │
+│   32 addresses → "Hey, these are all in 1 cache line"     │
+│                → Generate 1 memory request                 │
+│                                                            │
+└────────────────────────┬───────────────────────────────────┘
+                         │
+                         ▼  (1 request)
+                    ┌─────────┐
+                    │ L1/L2   │
+                    │  Cache  │
+                    └────┬────┘
+                         │
+                         ▼  (128-byte cache line returned)
+                    ┌─────────┐
+                    │ Crossbar│  ← Routes bytes to correct threads
+                    └────┬────┘
+                         │
+         ┌───────┬───────┼───────┬───────┐
+         ▼       ▼       ▼       ▼       ▼
+       T0:4B   T1:4B   T2:4B   ...    T31:4B
+       
+       Each thread gets its 4 bytes from the cache line
+└────────────────────────────────────────────────────────────┘
+
+BEFORE the pipelines even get involved:
+═══════════════════════════════════════
+
+┌──────────────────┐     ┌─────────────────────┐     ┌──────────────┐
+│  32 addresses    │ ──► │  Coalescing Logic   │ ──► │ 1-2 requests │
+│  from 32 threads │     │  (HW combines them) │     │ to cache     │
+└──────────────────┘     └─────────────────────┘     └──────────────┘
+
+This happens BEFORE pipelines!
+Pipelines handle the reduced # of transactions.
+
+The pipelines go through a memory hierarchy:
+
+LD/ST PIPELINE → MEMORY HIERARCHY
+═════════════════════════════════
+
+┌─────────────────────────────────────────────────────────────────┐
+│                        SM (Streaming Multiprocessor)            │
+│                                                                 │
+│   ┌─────────────┐                                               │
+│   │ LD/ST       │                                               │
+│   │ Pipelines   │                                               │
+│   └──────┬──────┘                                               │
+│          │                                                      │
+│          ▼                                                      │
+│   ┌─────────────────────────────────────┐                      │
+│   │  L1 Cache / Shared Memory (256 KB)  │  ← ~20-30 cycles     │
+│   │  (on-chip, per SM)                  │                      │
+│   └──────────────┬──────────────────────┘                      │
+│                  │                                              │
+└──────────────────┼──────────────────────────────────────────────┘
+                   │ Miss?
+                   ▼
+          ┌────────────────────┐
+          │  L2 Cache (shared) │  ← ~200-300 cycles
+          │  (on-chip, all SMs)│
+          └─────────┬──────────┘
+                    │ Miss?
+                    ▼
+          ┌────────────────────┐
+          │  Global Memory     │  ← ~400-800 cycles
+          │  (HBM, off-chip)   │
+          └────────────────────┘
+
+GPU Engineer's Motto:
+═════════════════════
+
+"Memory is slow. 
+ Hide it with parallelism.
+ Repeat for 20 years."
+
+- In short, GPUs excel at data-parallel workloads
+- OpenAI's Triton -> Python-based GPU language. 
+
+About CUDA Threads: 
+
+Threads, Warps, Blocks, and Grids: 
+CUDA structures parallel work into a 3-level hierarchy - threads, thread blocks, and grids - balance progammability with massive throughput. 
+- Thread executes kernel code 
+- Upto 1024 threads(your choice) -> 1 thread block -> SM executes it
+- Bunch of thread blocks -> Kernel grid -> Complete GPU unit executes it
+
+- Threadblock clusters -> Groups of thread blocks that can communicate with one another across SMs. 
+
+BEFORE (Ampere and earlier):
+════════════════════════════
+Block A's shared mem → Only Block A threads
+
+AFTER (Hopper+, Clusters):
+══════════════════════════
+Blocks in same cluster → Can access EACH OTHER's shared memory! --> do all sorts of shared memory operations. 
+
+┌─────────── CLUSTER ───────────┐
+│  Block A        Block B       │
+│  ┌──────┐      ┌──────┐       │
+│  │Shared│ ←──► │Shared│       │  DSMEM: Distributed
+│  │Mem A │      │Mem B │       │  Shared Memory
+│  └──────┘      └──────┘       │
+│      ↑              ↑         │
+│  Threads can access BOTH!     │
+└───────────────────────────────┘
+
+![alt text](image.png)
+
+THREAD BLOCK CLUSTER: DSMEM (Distributed Shared Memory)
+═══════════════════════════════════════════════════════
+
+┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+│      SM      │  │      SM      │  │      SM      │  │      SM      │
+│  ┌────────┐  │  │  ┌────────┐  │  │  ┌────────┐  │  │  ┌────────┐  │
+│  │████████│  │  │  │████████│  │  │  │████████│  │  │  │████████│  │
+│  │████████│  │  │  │████████│  │  │  │████████│  │  │  │████████│  │
+│  └────────┘  │  │  └────────┘  │  │  └────────┘  │  │  └────────┘  │
+│  ┌────────┐  │  │  ┌────────┐  │  │  ┌────────┐  │  │  ┌────────┐  │
+│  │ Shared │  │  │  │ Shared │  │  │  │ Shared │  │  │  │ Shared │  │
+│  │ Memory │  │  │  │ Memory │  │  │  │ Memory │  │  │  │ Memory │  │
+│  └───┬────┘  │  │  └───┬────┘  │  │  └───┬────┘  │  │  └───┬────┘  │
+└──────┼───────┘  └──────┼───────┘  └──────┼───────┘  └──────┼───────┘
+       │                 │                 │                 │
+       ▼                 ▼                 ▼                 ▼
+┌──────┴─────────────────┴─────────────────┴─────────────────┴───────┐
+│                        SM-to-SM DSMEM                              │
+│  ◄─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ►  │
+│         (Threads in cluster can access ANY SM's shared mem)        │
+└────────────────────────────┬───────────────────────────────────────┘
+                             │
+                             ▼
+┌────────────────────────────────────────────────────────────────────┐
+│                      L2 Cache / HBM Memory                         │
+│                   (Global, all SMs can access)                     │
+└────────────────────────────────────────────────────────────────────┘
+
+BEFORE Hopper:  SM's shared memory → only that SM's blocks
+AFTER (DSMEM):  SM's shared memory → accessible by entire cluster!
+
+WHAT'S INSIDE AN SM:
+════════════════════
+
+┌─────────────────────────────────────────┐
+│                  SM                      │
+│                                          │
+│  1. REGISTERS (256 KB on Blackwell)     │
+│     └── Per-thread private storage       │
+│     └── Fastest (0 cycle access)         │
+│                                          │
+│  2. L1 CACHE + SHARED MEMORY (256 KB)   │
+│     ├── L1 Cache: Hardware-managed       │
+│     └── Shared Memory: Programmer-managed│
+│         (Same physical SRAM, partitioned)│
+│                                          │
+└─────────────────────────────────────────┘
+
+- From now on, intra-thread-block shared memory funda: 
+
+- Within each thread block, threads use low-latency on-chip shared memory and synchronize with __syncthreads(). 
+- Because each barrier incurs overhead,
+you should minimize synchronization points
+
+__syncthreads() = TWO things in one
+═══════════════════════════════════
+
+1. BARRIER:     Wait for all threads to arrive here
+2. MEMORY FENCE: Make all writes visible to all threads in block
+
+- Kind of a consistency mechanism so that all threads have the same view of the data. 
+
+- Upto 1024 threads form a thread block 
+- Thread blocks are subdivided into warps of 32 threads that execute in lockstep under the SIMT model using a warp scheduler. 
+
+- Keeping more warps in flight is known as high occupancy on the SM. 
+- When CUDA code allows high occupancy, it means that when one warp stalls, another is ready to run --> this keeps the GPU's compute units busy. 
+
+
+CRITICAL DISTINCTION:
+═════════════════════
+
+RESIDENT warps = Warps LOADED on SM, ready to run (up to 64)
+EXECUTING warps = Warps running THIS CYCLE (4, one per scheduler)
+
+Occupancy = RESIDENT ÷ MAX RESIDENT
+          = NOT about per-cycle execution!
+
+          MEMORY OPS ARE ASYNC / NON-BLOCKING:
+════════════════════════════════════
+
+Cycle 1:   Scheduler issues LOAD for Warp 0
+           │
+           ├──► LOAD request sent to memory system
+           │    (memory system works INDEPENDENTLY)
+           │
+           └──► Warp 0 marked as "stalled, waiting for data"
+                Scheduler FORGETS about Warp 0, moves on
+
+Cycle 2:   Scheduler picks Warp 1 (doesn't care about Warp 0)
+
+Cycle 3:   Scheduler picks Warp 2
+
+           Meanwhile, IN PARALLEL:
+           ┌─────────────────────────────────────┐
+           │  Memory system doing its thing:     │
+           │    → Request travels to L1          │
+           │    → Miss, goes to L2               │
+           │    → Miss, goes to HBM              │
+           │    → Data fetched                   │
+           │    → Travels back through caches    │
+           │    → Arrives at register file       │
+           └─────────────────────────────────────┘
+
+Cycle 401: Memory system signals "Warp 0's data ready!"
+           Warp 0 marked as "ready to run"
+           Next time scheduler looks, Warp 0 is eligible again
+
+┌─────────────────────────────────────────────────────────────────┐
+│                          SM                                     │
+│                                                                 │
+│  ┌─────────────┐      ┌──────────────────────────────────────┐ │
+│  │ Schedulers  │      │  Warp Status Table                   │ │
+│  │             │      │  ┌──────┬────────────────────────┐   │ │
+│  │ "Who's not  │◄────►│  │Warp 0│ STALLED (waiting mem)  │   │ │
+│  │  stalled?"  │      │  │Warp 1│ READY ← pick this one! │   │ │
+│  │             │      │  │Warp 2│ READY                   │   │ │
+│  └─────────────┘      │  │Warp 3│ STALLED (waiting mem)  │   │ │
+│                       │  │...   │                         │   │ │
+│                       │  └──────┴────────────────────────┘   │ │
+└───────────────────────┼──────────────────────────────────────┼─┘
+                        │                                      │
+                        │ ASYNC!                               │
+                        ▼                                      ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    MEMORY SYSTEM                                │
+│                                                                 │
+│  Request Queue: [Warp0:addr1] [Warp3:addr2] [...]              │
+│                                                                 │
+│  Working independently... fetching data... no scheduler needed │
+│                                                                 │
+│  When done → Signal "Warp 0 data ready" → Update status table  │
+└─────────────────────────────────────────────────────────────────┘
+
+- The whole point of resident warps is that they are available when others get stalled, so that the process keeps contributing and hence contribute to the SM occupancy. 
+
 - Warp can be a reserved one or stalled one or nothing 
 - Keeping more warps in flight is known as high occupancy on the SM --> when one warp stalls, another is ready to run --> keeps GPU's compute units busy. 
 - Each SM has limited registers/shared memory--> if per-thread requirement of registers is high -- low occupancy 

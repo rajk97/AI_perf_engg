@@ -991,6 +991,84 @@ Scaling Out Workers as You Scale Out Number of GPU's:
 
 Multimodal Data Processing with NVIDIA DALI: 
 
+Multimodal Data processing with NVIDIA DALI: 
+- Data Loading Library(DALI) -> accelerates pre/processing of of complex/heavy data by moving it to the GPU/using optimized C++ code. 
+- For image/vid-> decoding/augmentation --> leverages NVIDIA's media acceleration hardware. 
+- For eg., CPU utilization can be cut down from 800%(8x100% 1xCPU utliilzation) -> (2000%-> 2x CPU utilization for just data I/o. while the gPU does the preprocessing steps)
+- You can also use GPU-friendly pre-processing operations and fuse them directly into GPU-based preprocessing computation graph --> Like the preprocessing steps go into the PyTorch/Tensorflow models directly. 
+- Benchmark to compare CPU-only pipeline/DALI-enabled/fully fused GPU-graph. 
+
+Creating High Quality LLM Datasets with NVIDIA Nemo Curator: 
+
+┌─────────────────────────────────────────────────────────────────┐
+│                     OFFLINE (Curator)                           │
+│  Raw Data → Clean → Dedupe → Tokenize → Pack → .bin/.idx        │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                     ONLINE (Training)                           │
+│           Just read + light shuffle → GPU go brrrr              │
+└─────────────────────────────────────────────────────────────────┘
+
+Clean OFFLINE, train ONLINE — GPUs should compute, not clean
+
+#   Core Concept        One-Liner
+-   ---------------     ------------------------------------------
+1   Purpose             Curator = Janitor for terabyte datasets
+2   Scaling             Multi-GPU preprocessing -> don't wait days
+3   Packing             Million small files -> few big binaries
+4   Synthetic data      Human data scarce? Generate more
+5   Quality filters     Dedupe + remove junk = cleaner model
+6   Offline vs Online   Do the hard work BEFORE training starts
+7   Goal                Training = GPU math, NOT string wrangling
+8   File format         .bin + .idx = memory-mapped, fast reads
+
+- Say for N epochs, you want N shuffles of the data --> in the preprocessing, it is not a bad idea to just store like N different copies --> not a crazy idea apparently lol 
+- Always preprocess your data well so that GPU is focussed only on compute 
+- NeMo's data loading still runs on CPUs. To bypass CPU I/O, you need to integrate it with tools like GDS. 
+- Optimiizing data pipelines can yield better performance gains than algorithmic optimizations. 
+
+Continuous Profiling and Tuning Workflow: 
+- Metric: samples/sec 
+- Steps for profiling: 
+1. Establish a baseline: 
+- Measure throughput(samples/sec), inference latency(ms)
+    - Start with 1 GPU, multiple GPU's in a node, multi-nodes 
+    - Check how the metrics are scaling 
+2. Profile the multi-GPU run for bottlenecks: 
+- NSight Systems --> Is GPU stalling frequently? Check for all kinds of bottlenecks:
+- Is the main process lagging behind the other worker processes?
+- Synchronization points where every thread is waiting?
+- If GPU is idle during all-reduce, communication is the bottleneck, if idle at start, data loading is bottleneck
+3. Zoom into specific kernels if needed: 
+- NSight Compute to identify if individual kernels are network-bandwidth bound/memory-bandwidth bound/compute bound. 
+4. Identify the cause: 
+- Take hypothesis -> validate/invalidate them using profiling tools. 
+- If memory bound, Fuse kernels = skip the HBM round-trip; smaller batch = less luggage to carry
+5. Apply fixes or optimizations: 
+- Based on all the information gathered so far. 
+
+- Use topoplogy aware comm algorithms 
+- If GPUs are spread across PCIe switches, bind the job to a single NUMA node. 
+6. Remeasure after every change
+7. Keep software updated, but always verify
+8. Leverage modern hardware features 
+9. Automate monitoring in production--> Kubernetes and other job schedulers integrate well with monitoring tools 
+10. Document and educate--> share configuration learnings to team 
+
+- Combine Nsight systems for a high-level system view, Nsight Compute for low-level GPU kernel profiles, and logging for NCCL and PyTorch. 
+
+Diagnosing Communication-Versus Compute-Bound Workloads: 
+- Change the ratio of communication to computation -- check how this affects the achieved network throughput measured in GB/s on the NIC. 
+- Fix comms, reduce compute - if throughput is still the same - network is bottleneck as more work being produced is not resulting in higher throughput. 
+- One way to do is to increase/decrease batch size
+- Very good advice - RTB
+- Watch 2 things: 
+    - Absolute GB/s on the NIC
+    - Relative time spent in communication relative to computation
+- Use Nsight Systems to get an end-to-end timeline. If you see GPUs idle, waiting on data in form of long gaps between compute kernels corresponding to NCCL wait, then you're most likely communication bound. If the GPUs are busy but not reaching expected FLOPS, you are likely memory bound or compute bound. NSight Compute and PyTorch profiler can help determine the kernel's memory and compute efficiency. 
+
 
 
 

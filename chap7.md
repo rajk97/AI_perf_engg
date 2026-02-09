@@ -1,3 +1,11 @@
+Profiling and Tuning GPU Memory Access Patterns: 
+
+Coalesced vs. Uncoalesced Global Memory Access: 
+- Leverage cache lines 
+- Modern GPUs - 128 byte lines - 4 32-byte sectors
+- Algined contiguous memory access will better leverage memory mechanics. 
+- On Blackwell GPU, per-device HBM3e bandwidth is 8 TB/s, on Grace Blackwell GB200/GB300 - increases to 16 TB/s. 
+
 ┌─────────────────────────────────────────────────────────────────────┐
 │  CONCEPT          │  PURPOSE                │  SIZE                 │
 ├─────────────────────────────────────────────────────────────────────┤
@@ -199,5 +207,51 @@ Thread 31 gets bytes 124-127←─┘
 │  This costs cycles and energy, even though result is 1 transaction! │
 └─────────────────────────────────────────────────────────────────────┘
 
+2/8/26:
 Vectorized Memory Access: 
-- 
+- Vectorized loads do not remove coalescing or stitching logic; they amortize it by running the same hardware logic fewer times over more data.
+
+- If each thread needs only one aligned float, scalar loads are already optimal; vector loads help only when collapsing multiple contiguous per-thread loads into a single instruction -- data better be aligned. 
+
+- The real win of float4 is reduced instruction and coalescer invocation count—not fewer bytes fetched or “better” cache-line utilization in the ideal scalar case.
+
+- What: Load float4 (16B) or float8 (32B) instead of individual floats → fewer instructions, same data
+
+- Alignment rule: Pointer address must be divisible by vector size (16B for float4, 32B for float8)
+
+- cudaMalloc is safe: Always returns 256-byte aligned → fine for any vector width
+
+- Offset trap: ptr + 1 breaks alignment; ptr + 4 keeps float4 aligned
+
+- Hopper: 16 bytes/thread max → float4 = 1 load, 8 floats = 2 loads
+
+- Blackwell: 32 bytes/thread max → 8 floats = 1 load
+
+- PyTorch/compilers: Auto-vectorize if data is aligned and contiguous — help them by aligning from the start
+
+- Alignment = starting address divisible by data size
+
+Blackwell: 32 bytes/thread in one instruction (with CUDA 13)
+
+Hopper: 16 bytes/thread max
+
+Alignment requirement: Compiler must prove 32-byte alignment for single 32B load
+
+If not proven: Compiler splits into two 16-byte loads → 2× instructions → slower
+
+Takeaway: Use alignas(32) on custom structs to help compiler emit single 32B loads on Blackwell
+
+Tiling and Data Reuse Using Shared Memory: 
+
+- Common pitfall: Repeated reading the same data from global memory. TIling is a technique to avoid this by loading chunks of data into faster on-chip shared memory - and reusing those chunks across many threads. 
+- 32x32 tile is a good tile size -- Aligns with a warp size of 32 (1 warp per row), fits well in shared memroy. 
+
+32×32 tile:
+- Each row = 32 floats = 1 warp can process one row
+- 32 rows = 32 warps = 1024 threads = 1 block (max block size!)
+
+- Perfect mapping: 1 thread per element, 1 warp per row
+- 32 floats × 4 bytes = 128 bytes = 1 cache line ✅
+- The main benefit of tiling is to increase arithmetic intensity by leveraging the on-chip shared memory. 
+
+

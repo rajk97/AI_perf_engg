@@ -254,4 +254,35 @@ Tiling and Data Reuse Using Shared Memory:
 - 32 floats × 4 bytes = 128 bytes = 1 cache line ✅
 - The main benefit of tiling is to increase arithmetic intensity by leveraging the on-chip shared memory. 
 
+2/9/26: 
+- The tiled kernel also accesses sA and sB in a way that avoids shared-memory bank conflicts, which is why shared memory throughput approaches 100%.
+- sA is broadcast (same value to all), sB is strided by 1 (hits all 32 banks) — neither causes conflict
+- Tile size is an optimizing parameter: too small → not enough reuse; too large → shared memory overflow and more bank conflicts. 32×32 is a sweet spot for many matrix operations on modern GPUs-- CUTLASS has profilers that can auto-optimize tile size for you.
+- 32×32 tile is a good default — experiment with size to balance reuse vs occupancy
+- Libraries do this for you — CUTLASS, cuBLAS, cuDNN, TorchInductor all auto-tile under the hood
+- cuTile (2025) — NVIDIA's Python API for expressing tile shapes without writing CUDA
 
+Avoiding Shared Memory Bank Conflicts:
+- Shared memory has 32 banks, each 4 bytes wide.
+- Bank conflict occurs when multiple threads in a warp access different addresses that map to the same bank
+- If all threads access the same address (broadcast)(even in the same bank) → no conflict, 1 access
+- If threads access addresses that map to different banks → no conflict, 1 access
+- If threads access addresses that map to the same bank → conflict, serialized accesses (up to 32 accesses if all threads hit the same bank)
+- In matrix transpose, naive access causes conflicts because threads access columns (strided by row size), which map to the same bank.
+- Every 32nd element(after 128 bytes) maps to the same bank, so strided access by 32 causes conflicts.
+- Always choose your stride and data layout so that threads in the same warp hit different banks and avoid that serializing bottleneck. 
+- Fix: Adjust data layouts in shared memory to avoid conflicts. 
+- Padding: 
+    - Before stride - 32 -- all accesses map to the same bank → 32-way conflict
+    - After stride - 33(make tile 32x33) -- accesses map to different banks → no conflict
+- PyTorch has no high-level API for padding, implement in CUDA, then load with torch.utils.cpp_extension || but cuDNN and cuBLAS implement the techniques under the hood to avoid bank conflicts and maximize throughput. 
+- Another technique used by libraries: Swizzling:
+
+- What: XOR row with col (col ^ row) to scatter accesses across banks --XOR turns tile[varying_row][constant_col](causing bank conflicts) into tile[varying_row][varying_col] — different columns = different banks (both write and consecutive read should do swizzling)
+- Why it works: XOR is symmetric (A^B == B^A) and preserves uniqueness — 32 unique inputs → 32 unique outputs → 32 different banks
+- Benefit over padding: No wasted memory, same conflict-free result
+
+Warp Shuffle Intrinsics: Avoid Shared Memory and Explicit Synchronization: 
+- What if we skip shared memory altogether?
+- NVIDIA GPUs support warp-synchronous primitives that allow threads in the same warp to exchange data through registers instead of shared memory. 
+- __shfl_sync: broadcast a value from one thread to all other threads in a warp. 

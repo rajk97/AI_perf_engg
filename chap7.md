@@ -286,3 +286,54 @@ Warp Shuffle Intrinsics: Avoid Shared Memory and Explicit Synchronization:
 - What if we skip shared memory altogether?
 - NVIDIA GPUs support warp-synchronous primitives that allow threads in the same warp to exchange data through registers instead of shared memory. 
 - __shfl_sync: broadcast a value from one thread to all other threads in a warp. 
+
+2/10/26:
+- What: __shfl_sync lets threads read each other's registers directly — no shared memory needed
+- Why it's fast: Register-to-register transfer = zero bank conflicts, zero sync overhead
+- Butterfly reduction: Halve distance each step (16→8→4→2→1), lane 0 gets final sum in 5 steps
+- Limitation: Works within 1 warp (32 threads) only — cross-warp still needs shared/global memory
+- Modern API: Cooperative Groups wraps shuffles with cleaner syntax (thread_group.shuffle())
+- Gold: Master intra-warp and inter-warp communication patterns as memory is the main bottleneck for GPU performance.
+
+Read-Only Data Caches: 
+- For some NLP tasks, we have repetitive, read-only data access patterns -- use the larger read-only data cache in L1 instead of small 64KB constant memory cache. 
+- const __restrict__ qualified pointers define function arguments as non-coherent and read-mostly(vs. read-only). 
+- For read-only data, the compiler may route loads through this read-only path when it can prove immutability, nonaliasing, and safety. 
+- Non-aliasing = pointers don't overlap; __restrict__ promises this, letting compiler optimize aggressively
+
+void kernel(float* A, float* B) {
+    float x = A[0];  // Load A[0]
+    B[0] = 5.0;      // Store to B[0]
+    float y = A[0];  // Load A[0] again
+    
+    // Can compiler reuse x for y?
+    // If A and B DON'T alias: yes, y = x (skip second load) ✅
+    // If A and B DO alias: no, must reload (B[0] changed A[0]!) ❌
+    
+    // Compiler must assume they MIGHT alias → conservative, slower
+}
+
+void kernel(float* __restrict__ A, float* __restrict__ B) {
+    // You PROMISE: A and B point to completely separate memory
+    // Compiler can now optimize aggressively!
+    
+    float x = A[0];
+    B[0] = 5.0;
+    float y = A[0];  // Compiler knows A wasn't touched → reuse x!
+}
+
+- Previously, __ldg() loads were used for read-only data, but now the compiler can route through the larger read-only cache when it can prove safety, so __restrict__ is the key to unlocking that optimization.
+- Broadcast: Same address across warp → 1 load serves 32 threads (free!)
+- Caching: Different addresses → cached for future reuse across warps
+- Lookup tables benefit from #2 — popular entries stay hot in cache, not broadcast -- next warp has faster access
+- Use texture/surface memory whenever your access pattern has 2D/3D locality that a regular cache might not handle optimally. 
+
+Asynchronous Memory Prefetching and Tensor Memory Accelerator: 
+- 800 cycles of DRAM latency -- overlap data transfer with compute 
+- CUDA Pipeline API + Tensor Memory Accelerator(TMA): Instead of having each warp use the SM's load and store units to fetch data from global memory, you can invoke the TMA engine to asynchronously fech an entire tile from global memory into shared memory. 
+- To start TMA transfer: use cuda::memcpy_async + cuda::pipeline
+- Double buffering/ping-ponging: While one tile is being processed in shared memory, the next tile is being fetched by TMA into another buffer -- overlap compute and memory transfer for maximum throughput.
+- TMA: specific hardware for bulk data transfer from global dram memory into on-chip l1 memory, that happens without the use of load/store instruction units asynchronously so that the warp can focus on computation. am i getting it right?
+- Use TMA for bulk, strided, and 2D/3D transfers. 
+
+

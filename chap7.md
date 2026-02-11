@@ -336,4 +336,6 @@ Asynchronous Memory Prefetching and Tensor Memory Accelerator:
 - TMA: specific hardware for bulk data transfer from global dram memory into on-chip l1 memory, that happens without the use of load/store instruction units asynchronously so that the warp can focus on computation. am i getting it right?
 - Use TMA for bulk, strided, and 2D/3D transfers. 
 
+Chap 7 done!
+
 

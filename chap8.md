@@ -57,3 +57,5 @@ the GPU’s physical hardware limits.
 │                                                                 │
 │  If you want 80T, change the ALGORITHM to have higher AI.       │
 └─────────────────────────────────────────────────────────────────┘
+
+2/13/26:

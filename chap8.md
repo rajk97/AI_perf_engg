@@ -59,3 +59,41 @@ the GPU’s physical hardware limits.
 └─────────────────────────────────────────────────────────────────┘
 
 2/13/26:
+Kernel Memory Throughput vs. Peak HBM Memory Bandwidth:
+- Bandwidth util >80%: Memory-bound — more compute won't help, reduce memory traffic instead
+- Increase AI by: Lower precision (FP16/FP8), Tensor Cores, kernel fusion (fewer intermediates)
+- Blackwell's advantage: 126 MB L2 cache + 10 TB/s inter-die NV-HBI — previously memory-bound kernels may now be compute-bound
+- Check L2 hit rate: High L2 hits = kernel may actually be compute-limited (cache is absorbing memory pressure)
+- L2 persistence (Blackwell): Pin critical data in L2 to keep it resident
+
+Kernel Compute Throughput vs. Peak GPU FLOPS: 
+- Low achieved FLOPS can be caused by low occupancy(not enough warps to do latency hiding) or instruction-level stalls. 
+- You can use NSight Compute's Occupancy section and Source Counters to pinpoint these issues. 
+- Acheived occupancy is measured per-SM -- warps in same SM only can share resources
+- Exec dependency stalls: Due to instruction dependencies
+- Power management can also throttle compute performance
+- Other tools for power usage: 
+    - CUDA C++ nvmlDeviceGetPowerUsage(), nvmlDeviceGetEnforcedPowerLimit() API's
+    - NVML Python API's
+
+Iteratively Profiling and Determining the Kernel Bottleneck: 
+- 4 fundamental bottlenecks of GPU's: 
+    1. underutilization 
+    2. latency-bound
+    3. memory-bound
+    4. compute-bound
+
+Underutilized → Latency-Bound → Memory-Bound → Compute-Bound
+     │                │               │               │
+     ▼                ▼               ▼               ▼
+  Not enough      Warps stall     Bandwidth        ALUs are
+  threads/work    waiting for     saturated,       the limit
+                  data            ALUs idle
+
+Bottleneck	    Symptom	                                                Fix
+Underutilized	Low FLOPS + Low bandwidth + Idle gaps	                Launch more threads/work
+Latency-Bound	Low bandwidth (not saturated), warps stalling on loads	Increase occupancy, ILP, prefetching, pipelining
+Memory-Bound	Bandwidth saturated (~80%+), ALUs idle	                Tiling, fusion, caching, lower precision
+Compute-Bound	ALUs maxed out, bandwidth has headroom	                ILP, unrolling, better instruction mix, Tensor Cores
+
+INT32 + FP32 can't run same cycle on unified cores — instruction mix matters for compute-bound kernels

@@ -271,6 +271,86 @@ Exposing Instruction-Level Parallelism:
 
 Warp Scheduling and Dual Issue Instructions: 
 
+- Blackwell has 4 warp schedulers per SM, each can dual-issue (2 independent instructions/cycle) if they target different pipelines (e.g., math + memory)
+- GPU's can't do OOO(but can do reordering -- see below) unlike speculative order in CPU's
+- Don't unnecessarily serialize independent work in a thread boss! 
+
+COMPILER REORDERING (GPU):                  CPU OOO (runtime):
+═══════════════════════════                 ═══════════════════════════
+
+Done ONCE at compile time                   Done EVERY cycle at runtime
+Sees only STATIC code structure             Sees LIVE runtime state
+Can't react to variable latency             Reacts to actual cache hits/misses
+Fixed order in binary → never changes       Order changes every execution
+
+Example:
+  Load A → takes 5 cycles (L1 hit)          Load A → takes 5 cycles (L1 hit)
+  Load B → takes 400 cycles (DRAM miss)     Load B → takes 400 cycles (DRAM miss)
+  MUL = A * B                               MUL = A * B
+
+  Compiler arranged: LOAD A, LOAD B, MUL    CPU sees: "MUL blocked on B, skip ahead"
+  GPU hits MUL: B not ready → STALL         CPU finds instruction 50 lines later → runs it NOW
+  Only escape: switch to another warp       CPU keeps finding work until B arrives
+
+  Compiler couldn't know B would be slow!   Hardware sees it in real time and adapts
+
+  ILP and Occupancy: 
+  - Increase ILP --> more register usage per thread --> less no. of threads --> less no. of warps --> reduced occupancy
+  - GPU instruction decode bandwidth: Maximum number of instructions per cycle that the instruction-fetch and decode hardware can push to execution units. 
+  - "4-way ILP" does NOT mean 4 instructions issued in 1 cycle
+  It means 4 independent instructions IN-FLIGHT simultaneously (across multiple cycles)
+
+  - Dual-issue (2/cycle) and ILP (pipeline depth) are ORTHOGONAL — they multiply
+
+  4-way ILP = 4 independent instructions IN-FLIGHT at the same time
+
+Pipeline (4-cycle depth):
+
+Cycle:    1     2     3     4     5     6     7
+MUL_1:  [S1]  [S2]  [S3]  [S4]  DONE
+MUL_2:        [S1]  [S2]  [S3]  [S4]  DONE
+MUL_3:              [S1]  [S2]  [S3]  [S4]  DONE
+MUL_4:                    [S1]  [S2]  [S3]  [S4]→DONE
+
+At cycle 4: all 4 are in-flight simultaneously ← THIS is 4-way ILP
+First result arrives at cycle 5 (not cycle 4!)
+All 4 complete by cycle 8 (not cycle 4!)
+
+4 instructions in 4 cycles would mean 1 cycle each — that's not what happens.
+4 instructions OVERLAPPING across 4 pipeline stages — that's ILP.
+
+- For Blackwell, the ideal ILP config is 2-4
+
+Loop Unrolling, Interleaving, and Compiler Hinting: 
+- Loop unrolling: Hides multiple memory loads latencies with multiple arithmetic opeerations 
+- Interleaving independent operations: You know what it is
+- Using compiler hints: #pragma unroll/adjusting -maxrregcount
+
+PRE-BLACKWELL (e.g., Ampere):
+  Separate INT32 and FP32 cores:
+  ┌────────┐  ┌────────┐
+  │ FP32   │  │ INT32  │   ← Two different hardware units
+  │ core   │  │ core   │   ← Can run simultaneously
+  └────────┘  └────────┘
+  Cycle 1: FP32 mul + INT32 add → BOTH execute ✅
+
+BLACKWELL:
+  Unified CUDA core (INT32 + FP32 merged):
+  ┌──────────────┐
+  │ Unified Core │   ← One unit, picks FP32 OR INT32 each cycle
+  └──────────────┘
+  Cycle 1: FP32 mul  → executes
+  Cycle 2: INT32 add → executes
+  Cannot do both in same cycle ❌
+
+ - Mixed INT/FP workloads: use warp-level concurrency instead of per-core dual-issue
+
+ Profiling and Mitigating Register Pressure: 
+ - Don't go too far on register usage with aggressive loop unrolling 
+ - If ILP is used -- IPC increases, Issue Efficiency increases, Stall: Exec Dependency decreases
+
+ - Chap 8 is done!
+
 
 
 

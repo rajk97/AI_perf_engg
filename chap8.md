@@ -193,3 +193,85 @@ Intra-warp divergence cause:
 - If/else: In SIMT, the warp must exeute both paths serially: when the if threads are executing, other threads are idle, and vice versa. 
 
 Techniques to avoid warp divergence: 
+
+1. Restructure Conditions: 
+    Three strategies:
+        - Sort/partition data → homogeneous warps (no divergence)
+        - Lift condition out of inner loop → branch once, not every iteration
+        - Separate kernels → kernel A handles negatives, kernel B handles positives
+2. Separate into multiple kernels: 
+
+    - Separate kernels = keep data in place, use prefix sum to find which elements belong to which category, then launch a dedicated kernel per category
+    - It's an alternative to sorting — instead of reorganizing data, you reorganize work across kernels
+    - Cost: extra prefix sum computation + multiple kernel launches
+    - Benefit: no divergence within any kernel, original data order preserved
+    - Worth it only when divergent code paths are large (many instructions each)   
+3. Rewrite conditions to be warp-unanimous: 
+    - More like all OR none -- all threads in the warp execute an instruction or not 
+    - Split work by warp ID, not thread data — warps agree, threads don't diverge.
+4. Utilize warp-vote parallel algorithms: 
+    - LANE: Thread within a warp
+    - Lane = thread's position (0-31) within a warp — just another name for thread-in-warp
+    - __ballot_sync = every lane votes, returns 32-bit mask of who said yes
+    - __any_sync = "did anyone vote yes?" — quick check to skip work entirely
+    - __all_sync = "did everyone vote yes?" — quick check for unanimous path
+    - Voting lets warp COLLECTIVELY decide, then compact work into fewer lanes
+    - Avoids divergence by converting per-lane branching into lane-count-based execution
+    - Tradeoff: eliminates divergence but may cause load imbalance (few lanes do all work) -- not clear how it eliminates divergence -- will need to wait for when it comes up again 
+5. Predicate short lines: 
+    - Predication = compiler runs BOTH paths for ALL threads, SELECTs correct result per thread — avoids branch management overhead (~3-5 cycles) at the cost of computing both paths
+    - IMP: Worth it only for SHORT branches where overhead > compute; for long branches the savings are negligible
+    - Encourage with ternary (?:) or arithmetic masking (cond * f(x) + (1-cond) * g(x))
+
+Profiling and Detecting Warp Divergence: 
+
+- "Warp execution efficiency" = profiler metric showing % of active threads per warp (e.g., 30% = only ~10 of 32 lanes doing useful work)
+- "Predicated-off instructions" = profiler counts instructions that were issued but masked — look for inflated dynamic instruction count vs actual data processed
+- "Goodput" = effective throughput after subtracting wasted masked-lane work
+
+Using Predication to Minimize Divergence: 
+
+- Predication eliminates DIVERGENCE (no serialized paths, no branch overhead) but NOT compute waste
+- Every lane still executes both sides — one result is thrown away per lane
+- The only true zero-waste solution: hardware native ops (max, min, abs) that compute the answer in 1 instruction
+- Predication vs divergence = same wasted compute, different packaging overhead
+- Overhead is supposedly lower in predicattion compared to warp divergence. 
+
+- GPU ALUs have native hardware for max, min, abs, clamp, saturate — no branching needed at all
+- torch.maximum(X, 0) compiles to a SINGLE fmax instruction — not predication, not branching, just one ALU op
+- PyTorch's "vectorized operations" use these native instructions — that's why they're divergence-free
+- The "special hardware" = dedicated circuits in the ALU for common math ops that would otherwise branch
+- Mnemonic: "max is a circuit, not a choice — hardware solved it before software had to."
+
+- Warp divergence = lanes execute instructions they don't need → ALU cycles consumed with no useful output = lost goodput
+- Goodput = useful work done / total work done — divergence inflates the denominator
+
+- Warp execution efficiency = average % of active (non-masked) lanes per instruction across all warps
+- Formula: (total active lane-instructions) / (total issued lane-slots) × 100
+
+HARDWARE REALITY:
+  All 32 lanes physically run the instruction through the ALU
+  ← You're correct about this!
+
+PROFILER'S DEFINITION:
+  "Active" = lane whose result is COMMITTED (written to register)
+  "Inactive" = lane whose result is DISCARDED (masked off)
+  
+  The profiler doesn't care if the ALU computed something.
+  It only counts lanes that PRODUCED useful output.
+
+Exposing Instruction-Level Parallelism: 
+
+- ILP = overlap independent instructions to fill idle cycles (higher IPC, not more FLOPs)
+- GPU is in-order: developer unrolls, compiler schedules across parallel units (FP, INT, LD/ST, SFU, Tensor)
+- CPU has hardware OOO: finds ILP automatically — GPU traded that for more cores + less power
+- ILP hides latency WITHIN a warp; occupancy hides latency ACROSS warps — complementary
+- Only helps if idle slots exist — useless when already compute-bound
+- Tools: #pragma unroll, -maxrregcount (more registers = more ILP, less occupancy)
+
+Warp Scheduling and Dual Issue Instructions: 
+
+
+
+
+

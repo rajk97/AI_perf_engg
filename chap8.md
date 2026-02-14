@@ -97,3 +97,99 @@ Memory-Bound	Bandwidth saturated (~80%+), ALUs idle	                Tiling, fusi
 Compute-Bound	ALUs maxed out, bandwidth has headroom	                ILP, unrolling, better instruction mix, Tensor Cores
 
 INT32 + FP32 can't run same cycle on unified cores — instruction mix matters for compute-bound kernels
+
+2/14/26:
+- Memory-bound = DRAM bandwidth saturated (shared by all SMs) — individual SM pipes are fast enough, the shared source (HBM) is the bottleneck
+
+GPU KERNEL BOTTLENECK REFERENCE TABLE
+=====================================
+
+┌──────────────────┬───────────────────────────────────┬──────────────────────────────────┬──────────────────────────────────────┐
+│ Limiting Factor  │ Description                       │ Profiler Indicators              │ Remedies                             │
+├──────────────────┼───────────────────────────────────┼──────────────────────────────────┼──────────────────────────────────────┤
+│                  │                                   │                                  │                                      │
+│ Memory Bound     │ Moving as much data as you can    │ High memory-bandwidth            │ Increase arithmetic intensity         │
+│                  │ — close to peak DRAM bandwidth    │ utilization is near peak,        │ (tiling, fusion) and improve          │
+│                  │ — but not enough work per byte    │ low FLOPS.                       │ coalescing and caching.(Reduce loading waste memory too)               │
+│                  │ to fully utilize ALUs.            │                                  │                                      │
+│                  │                                   │                                  │                                      │
+├──────────────────┼───────────────────────────────────┼──────────────────────────────────┼──────────────────────────────────────┤
+│                  │                                   │                                  │                                      │
+│ Compute Bound    │ Hidden memory latency, no longer  │ High FLOPS approaching GPU       │ Exploit more ILP (dual-issue,         │
+│                  │ saturating memory bandwidth.      │ peak, low memory utilization.     │ loop unroll), use specialized         │
+│                  │ ALUs (CUDA cores + Tensor Cores)  │                                  │ units (FP16/FP8/FP4/Tensor Cores),   │
+│                  │ are the bottleneck.               │                                  │ reduce dependencies, fuse work,      │
+│                  │                                   │                                  │ leverage lower precision/sparsity.   │
+│                  │                                   │                                  │                                      │
+├──────────────────┼───────────────────────────────────┼──────────────────────────────────┼──────────────────────────────────────┤
+│                  │                                   │                                  │                                      │
+│ Latency Bound    │ Not sustaining enough concurrent  │ Low achieved bandwidth well      │ Raise occupancy, add ILP (unroll,     │
+│                  │ work to hide individual load/     │ below peak, high "stall-on-      │ multiple accumulators), intra-kernel  │
+│                  │ store latencies, so warps stall   │ scoreboard" or "not selected"    │ pipelining, and software prefetch.    │
+│                  │ waiting on data.                  │ percentages.                     │                                      │
+│                  │                                   │                                  │                                      │
+├──────────────────┼───────────────────────────────────┼──────────────────────────────────┼──────────────────────────────────────┤
+│                  │                                   │                                  │                                      │
+│ Underutilizing   │ Not fully occupying SMs or        │ Low occupancy and low achieved   │ Increase problem size or batch work,  │
+│ the GPU          │ launching enough work — both      │ bandwidth, low FLOPS, timeline   │ launch more threads/blocks, fuse      │
+│                  │ memory and compute resources      │ shows gaps or sparse kernel      │ tasks, use persistent kernels or      │
+│                  │ remain idle.                      │ activity.                        │ streams.                             │
+│                  │                                   │                                  │                                      │
+└──────────────────┴───────────────────────────────────┴──────────────────────────────────┴──────────────────────────────────────┘
+
+OPTIMIZATION ORDER:
+═══════════════════
+Underutilized → Latency Bound → Memory Bound → Compute Bound
+
+"Fix one bottleneck, reveal the next"
+
+QUICK DIAGNOSIS (2x2 Grid):
+═══════════════════════════
+
+                    LOW Memory BW Util       HIGH Memory BW Util
+                 ┌──────────────────────┬──────────────────────┐
+  LOW FLOPS      │  Underutilized OR    │  Memory Bound        │
+                 │  Latency Bound       │                      │
+                 ├──────────────────────┼──────────────────────┤
+  HIGH FLOPS     │  Compute Bound       │  Optimal! (both      │
+                 │                      │  near peak)          │
+                 └──────────────────────┴──────────────────────┘
+
+Tuning Occupancy: 
+- While maximizing occupancy ensures that many warps are availabe to run, those warps might still be idle if waiting on memory or if executing divergent code. Therefor, after achieving a reasonable occupancy (e.g., 50-70%), focus on warp efficiency and latency-hiding rather than obsessing over 100% occupancy. 
+- Blackwell has 255 registers per thread limit. 
+- How to tune occupancy:
+    - Increase no. of threads
+    - Be mindful of the resource usage
+    - __launch_bounds__ = you tell the compiler your TUNED launch config so it budgets registers to make that occupancy actually fit. 
+    - cudaOccupancyMaxPotentialBlockSize() = asks runtime 'what block size gives max occupancy for this kernel's register/shmem usage?'
+    - cudaOccupancyMaxActiveBlocksPerMultiprocessor() = asks runtime 'how many blocks of this config can fit on one SM?'
+    - Occupancy API answers at runtime (knows actual resource usage), __launch_bounds__ instructs at compile time (shapes resource usage).
+
+- CUDA Graphs = record a kernel sequence once, replay with near-zero launch overhead → GPU stays busy between kernels instead of waiting for CPU.
+
+__launch_bounds__(maxThreadsPerBlock, minBlocksPerMultiprocessor): Compiler optimizes register usage, 
+
+- PyTorch handles occupancy tuning internally — built-in kernels already pick optimal block sizes and launch configs.
+- Small tensors → few threads → GPU underutilized. Fix: batch operations or fuse with torch.compile.
+- torch.compile merges many small ops into one big fused kernel → more work per launch → better occupancy.
+- torch.compile(mode='max-autotune') for stable shapes, mode='reduce-overhead' for small-batch loops — both enable CUDA Graphs when profitable.
+- Use fused optimizers (AdamW(fused=True)) + AMP to reduce per-op overhead.
+- Only write custom CUDA kernels if built-in ops aren't enough — if you do, same occupancy rules apply.
+
+Improving Warp Execution Efficiecy: 
+- Warp inefficiencies: 
+    1. Warp divergence: When threads within a warp do not all do the same work
+    2. Threads are waiting on data loads
+
+- To improve warp efficiency: 
+    - Improve memory coalescing
+    - MInimize thread divergence
+    - Use warp-level intrinsics for optimal intrawarp communication 
+
+- Speeds are only 5-30% but important 
+
+Intra-warp divergence cause: 
+- If/else: In SIMT, the warp must exeute both paths serially: when the if threads are executing, other threads are idle, and vice versa. 
+
+Techniques to avoid warp divergence: 

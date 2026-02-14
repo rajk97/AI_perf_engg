@@ -1,0 +1,53 @@
+GPU KERNEL BOTTLENECK REFERENCE TABLE
+=====================================
+
+┌──────────────────┬───────────────────────────────────┬──────────────────────────────────┬──────────────────────────────────────┐
+│ Limiting Factor  │ Description                       │ Profiler Indicators              │ Remedies                             │
+├──────────────────┼───────────────────────────────────┼──────────────────────────────────┼──────────────────────────────────────┤
+│                  │                                   │                                  │                                      │
+│ Memory Bound     │ Moving as much data as you can    │ High memory-bandwidth            │ Increase arithmetic intensity         │
+│                  │ — close to peak DRAM bandwidth    │ utilization is near peak,        │ (tiling, fusion) and improve          │
+│                  │ — but not enough work per byte    │ low FLOPS.                       │ coalescing and caching.               │
+│                  │ to fully utilize ALUs.            │                                  │                                      │
+│                  │                                   │                                  │                                      │
+├──────────────────┼───────────────────────────────────┼──────────────────────────────────┼──────────────────────────────────────┤
+│                  │                                   │                                  │                                      │
+│ Compute Bound    │ Hidden memory latency, no longer  │ High FLOPS approaching GPU       │ Exploit more ILP (dual-issue,         │
+│                  │ saturating memory bandwidth.      │ peak, low memory utilization.     │ loop unroll), use specialized         │
+│                  │ ALUs (CUDA cores + Tensor Cores)  │                                  │ units (FP16/FP8/FP4/Tensor Cores),   │
+│                  │ are the bottleneck.               │                                  │ reduce dependencies, fuse work,      │
+│                  │                                   │                                  │ leverage lower precision/sparsity.   │
+│                  │                                   │                                  │                                      │
+├──────────────────┼───────────────────────────────────┼──────────────────────────────────┼──────────────────────────────────────┤
+│                  │                                   │                                  │                                      │
+│ Latency Bound    │ Not sustaining enough concurrent  │ Low achieved bandwidth well      │ Raise occupancy, add ILP (unroll,     │
+│                  │ work to hide individual load/     │ below peak, high "stall-on-      │ multiple accumulators), intra-kernel  │
+│                  │ store latencies, so warps stall   │ scoreboard" or "not selected"    │ pipelining, and software prefetch.    │
+│                  │ waiting on data.                  │ percentages.                     │                                      │
+│                  │                                   │                                  │                                      │
+├──────────────────┼───────────────────────────────────┼──────────────────────────────────┼──────────────────────────────────────┤
+│                  │                                   │                                  │                                      │
+│ Underutilizing   │ Not fully occupying SMs or        │ Low occupancy and low achieved   │ Increase problem size or batch work,  │
+│ the GPU          │ launching enough work — both      │ bandwidth, low FLOPS, timeline   │ launch more threads/blocks, fuse      │
+│                  │ memory and compute resources      │ shows gaps or sparse kernel      │ tasks, use persistent kernels or      │
+│                  │ remain idle.                      │ activity.                        │ streams.                             │
+│                  │                                   │                                  │                                      │
+└──────────────────┴───────────────────────────────────┴──────────────────────────────────┴──────────────────────────────────────┘
+
+OPTIMIZATION ORDER:
+═══════════════════
+Underutilized → Latency Bound → Memory Bound → Compute Bound
+
+"Fix one bottleneck, reveal the next"
+
+QUICK DIAGNOSIS (2x2 Grid):
+═══════════════════════════
+
+                    LOW Memory BW Util       HIGH Memory BW Util
+                 ┌──────────────────────┬──────────────────────┐
+  LOW FLOPS      │  Underutilized OR    │  Memory Bound        │
+                 │  Latency Bound       │                      │
+                 ├──────────────────────┼──────────────────────┤
+  HIGH FLOPS     │  Compute Bound       │  Optimal! (both      │
+                 │                      │  near peak)          │
+                 └──────────────────────┴──────────────────────┘

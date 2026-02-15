@@ -132,3 +132,194 @@ PyTorch and Arithmetic Intensity:
 - SDPA dispatches to FlashAttention/cuDNN automatically — control with sdpa_kernel(SDPBackend.FLASH_ATTENTION)
 - Prefer high-level ops (torch.matmul, nn.functional) over many small kernels — libraries call optimized fused kernels
 - Custom/nonstandard ops may not get auto-fused — manual optimization still needed for those
+
+2/15/26: 
+- On variable length sequences, use PyTorch's nested/rugged tensors
+- Batch of 3 sequences, lengths: [3, 5, 2]
+
+With padding (standard approach, pad to max_len=5):
+┌───────────────────────────┐
+│ seq1: [A B C 0 0]         │  ← 2 zeros = wasted memory loads
+│ seq2: [D E F G H]         │  ← full, no waste
+│ seq3: [I J 0 0 0]         │  ← 3 zeros = wasted memory loads
+└───────────────────────────┘
+Total: 15 elements loaded, only 10 are useful = 33% waste
+Attention computes on zeros too = wasted FLOPS
+
+With Nested/Ragged Tensors — Pack Tightly:
+┌───────────────────┐
+│ [A B C D E F G H I J]  ← one contiguous buffer, NO zeros
+└───────────────────┘
++ metadata: offsets = [0, 3, 8, 10]  ← "seq1 starts at 0, seq2 at 3, seq3 at 8"
+
+- Especially valuable for LLM attention with mixed sequence lengths (e.g., batch has lengths [32, 512, 128]).
+- Still maturing in PyTorch — verify operator coverage for your workload and profile both memory traffic and kernel time.
+
+Mixed Precision and Utilizing Tensor Cores:
+- NVIDIA GPU's have TF32, FP16, FP8, FP4, INT8 in Tensor Cores 
+- Mixed precision solves memory-bound primarily because smaller datatypes = fewer bytes moved for the same FLOPS = higher AI.
+- Tensor Cores raise the compute roof (more peak FLOPS), TMA+TMEM feed them without stalls — together they make it nearly impossible to stay memory-bound.
+
+Blackwell SM:
+  ┌──────────────────────────────────────┐
+  │  Register File (256 KB)              │ ← general purpose: local vars, addresses, loop counters
+  │                                      │
+  │  TMEM (256 KB)                       │ ← dedicated: Tensor Core accumulators ONLY
+  │                                      │
+  │  Shared Memory (228 KB)              │ ← shared across block: tiles, communication
+  │                                      │
+  │  CUDA Cores (ALUs)                   │ ← scalar FP32/INT ops
+  │  Tensor Cores                        │ ← matrix ops (MMA)
+  └──────────────────────────────────────┘
+Inside one SM:
+  ┌─────────────────────────────────────┐
+  │  4 Warp Schedulers                  │
+  │     │                               │
+  │     ├──→ CUDA Cores (128 per SM)    │  ← scalar ops: add, multiply, compare
+  │     │    one thread = one operation  │     e.g., x = a + b
+  │     │                               │
+  │     ├──→ Tensor Cores (4 per SM)    │  ← matrix ops: 16×16 MMA in one instruction
+  │     │    one warp = one matrix op   │     e.g., D = A×B + C (whole tile at once)
+  │     │                               │
+  │     ├──→ Load/Store Units           │
+  │     └──→ Special Function Units     │  ← sin, cos, sqrt, etc.
+  └─────────────────────────────────────┘
+
+- Each Blackwell SM has 256 KB TMEM dedicated to Tensor Core accumulators — frees registers for other work, boosts occupancy.
+- TMA asynchronously copies tiles from global → shared memory, Tensor Core instructions implicitly move data from shared memory → TMEM — no SM intervention needed.
+- Lower precision (FP16/FP8/FP4) = fewer bytes per element = higher arithmetic intensity for same FLOPS = shifts kernel from memory-bound toward compute-bound.
+- AI boost is multiplicative: FP16 = 2× AI, FP8 = 4× AI, FP4 = 8× AI compared to FP32.
+- In Nsight Compute, successful mixed precision shows: memory stalls drop, dependency/pipeline stalls rise — that means you shifted the bottleneck from memory to compute.
+- Verify with Nsight Compute Roofline chart (AI should shift right) and Speed of Light panel (memory util down, compute util up).
+
+- CUTLASS = CUDA Templates for Linear Algebra Subroutines. It's NVIDIA's open-source C++ template library for writing high-performance GEMM (matrix multiply) and convolution kernels.
+
+Without CUTLASS:
+  You manually write: TMA loads → shared mem staging → TMEM allocation → PTX MMA instructions → pipeline sync
+  = hundreds of lines of expert-level CUDA
+
+With CUTLASS:
+  You configure a template: "I want FP16 GEMM, 128×128 tiles, 2-stage pipeline"
+  CUTLASS generates the optimized kernel with TMA + TMEM + Tensor Core instructions automatically
+
+- It's what cuBLAS uses under the hood. PyTorch → cuBLAS/cuDNN → CUTLASS-level code → Tensor Cores.
+- CUDA Pipeline API (<cuda/pipeline>) = formal producer/consumer sync for overlapping async memory copies with Tensor Core compute.
+- cuda::memcpy_async copies global → shared memory without blocking the SM — the SM can compute on previous tiles while the next tile loads.
+- Double buffering (ping-pong): two shared memory buffers — load into one while computing from the other → memory latency hidden behind compute.
+- Tensor Cores work without pipelining, but without it the SM stalls waiting for data — pipelining is what makes them run at full throughput.
+- You don't manually manage TMEM — hardware and libraries (CUTLASS) handle operand movement between shared memory and TMEM automatically.
+
+TF32 and Automatic Mixed Precision(PyTorch):
+
+  - TF32 = FP32 exponent (8-bit range) + FP16 mantissa (10-bit precision) → runs on Tensor Cores, not CUDA cores → higher TFLOPS, same dynamic range as FP32.
+  - torch.set_float32_matmul_precision('high') → torch.matmul silently routes FP32 inputs through TF32 Tensor Cores.
+  - AMP autocast: GEMM/conv → FP16/BF16 Tensor Cores, accumulation → FP32, sensitive ops (layernorm, softmax) → FP32.
+  - BF16 exponent = 8 bits (same as FP32) → no overflow → no GradScaler needed. FP16 exponent = 5 bits → overflow risk → needs GradScaler.
+  - Format cheat sheet:
+      FP32: 1 sign + 8 exp + 23 mantissa = 4 bytes
+      TF32: 1 sign + 8 exp + 10 mantissa = 19 bits (internal only, stored as FP32)
+      BF16: 1 sign + 8 exp + 7 mantissa = 2 bytes
+      FP16: 1 sign + 5 exp + 10 mantissa = 2 bytes
+  - Throughput ladder: FP32 CUDA cores < TF32 Tensor Cores < BF16/FP16 Tensor Cores < FP8 < FP4 (each step ~2× TFLOPS).
+
+- When using reduced precision or 2:4 sparsity, use higher batch sizes to amortize overheads and maximize Tensor Core utilization.
+
+BF16/FP16, FP8, and FP4 Reduced Precision:
+- BF16/FP16 on Tensor Cores ≈ 4× FP32 throughput — Tensor Cores issue many FMAs per cycle on half-sized elements.
+- FP16 exponent = 5 bits → small gradients underflow to zero → needs loss scaling (static or dynamic GradScaler).
+- BF16 exponent = 8 bits (same as FP32) → no underflow → no loss scaling needed → simpler training workflow.
+- BF16 preferred for training on modern GPUs — FP32-like stability without GradScaler complexity.
+- Loss scaling = multiply loss by a large factor before backward pass → keeps tiny gradients above FP16's underflow threshold → unscale after.
+
+- BF16 has 4x FLOPS/s compared to FP32
+Think of the MMA as:  A[M×K] × B[K×N] = C[M×N]
+
+FP32 (TF32):   M=16, K=8,  N=8   → 16×8 × 8×8  = 1024 FMAs
+FP16:           M=16, K=16, N=16  → 16×16 × 16×16 = 4096 FMAs
+                     ↑       ↑
+                   K doubled  N doubled  (2× × 2× = 4×)
+
+                        FP32          FP16
+Bytes per element:      4             2          → 2× fewer bytes
+FLOPS (same algorithm): same          same       → same useful work
+AI:                     F/B           F/(B/2)    → 2× AI
+
+Peak TFLOPS (hardware): 80T           300T+      → ~4× peak throughput
+
+- FP8 = half the bytes of FP16 → 2× weights per HBM transaction → 2-3× BF16/FP16 TFLOPS with FP32/TF32 accumulation.
+- NVFP4 = 4-bit format with two-level micro-scaling (per-microblock + higher-level scale) to retain accuracy at extreme compression.
+- B200 NVFP4 peak = 10 PFLOPS vs FP32 peak = 80 TFLOPS → ~125× theoretical throughput gain per weight.
+- B300 (Ultra) = 15 PFLOPS NVFP4 → 50% more than B200.
+- FP4 elements are tiny → 256 KB TMEM fits huge tiles (256×256) → more on-chip reuse → less DRAM traffic.
+- Low-precision accumulation happens automatically: kernel reads FP4 from HBM → Tensor Cores do FP4×FP4 → accumulate into FP32/BF16.
+- Each precision drop (FP32→FP16→FP8→FP4) roughly doubles ops/byte → doubles AI → pushes kernel from memory-bound → compute-bound.
+- Accuracy must be validated per model — NVFP4 needs calibration to confirm precision drop is acceptable.
+
+- Smaller precision = more elements per fixed-width datapath = more FMAs per Tensor Core instruction = higher TFLOPS.
+- Smaller precision = fewer bytes per element = more data per HBM transaction = higher AI.
+- Accumulation stays in FP32 because summing thousands of small products in low precision loses significant digits.
+
+INT8 Reduced Precision and DP4A Instructions for Inference: 
+- INT8 = 1 byte/element vs FP32 = 4 bytes → 75% less memory traffic for weights → 4× more data per HBM transaction.
+- DP4A = SIMD dot-product on CUDA cores: 4 INT8 MACs per instruction vs 1 FP32 FMA → 4× throughput even on regular cores.
+- INT8 also runs on Tensor Cores via integer MMA instructions → even higher throughput than DP4A on CUDA cores.
+- Primarily for inference — training needs higher precision for gradients.
+- TMA + TMEM keep INT8 data feeding Tensor Cores without stalls → compute-bound, not memory-bound.
+
+Using CUTLASS for Optimal Arithmetic Intensity and Tensor Core Performance:
+- "CUTLASS is a C++ template library that generates high-performance Tensor Core kernels from a configuration — you specify WHAT you want (precision, tile size, pipeline), it builds HOW to do it."
+- CUTLASS does automatic optimizations like shared‐memory tiling, asynchronous memory transfers, and double buffering. 
+- All you have to do is to make sure your kernel uses CUTLASS optimally
+GEMM: General Matrix Multiply
+
+Without cp.async (old way):
+
+DRAM → L2 → L1 → Registers → Registers → Shared Memory
+                   ↑            ↑     ↑
+              cache hit    load into   store from
+                          register    register to SMEM
+
+Thread does: register = global_load(addr);   // data lands in register
+             shared_mem[idx] = register;      // thread writes to SMEM
+
+ With cp.async (bypass L1):
+
+DRAM → L2 → ─────────────────────────→ Shared Memory  -- using DMA not TMA
+             skips L1, skips registers 
+
+cp.async:  thread issues the copy instruction (still uses thread to set up address/size)
+TMA:       dedicated hardware unit does everything — address calc, copy, no thread involvement at all
+           DRAM → L2 → Shared Memory (hardware handles it entirely)                        
+
+Method              Who sets up the copy?     Who moves the data?      Thread busy?
+─────────────────   ──────────────────────    ─────────────────────    ────────────
+Regular load/store  Thread (address + load)   Thread (via registers)   YES — fully blocked
+cp.async            Thread (issues instruction) Hardware DMA engine     Partially — thread issues cmd, then free
+TMA                 Hardware unit             Hardware unit             NO — thread just triggers it, done
+
+- cp.async - DMA 
+- cp.async.bulk.tensor - TMA
+- CUTLASS also leverages thread block clusters
+
+Hand-tuned MMA kernel:
+  - Written by an expert in raw PTX/CUDA
+  - Manually manages TMA descriptors, TMEM allocation, pipeline stages, barrier sync
+  - Hundreds of lines of low-level code
+  - Squeezes every last drop of performance
+
+CUTLASS GEMM kernel:
+  - Generated from C++ templates
+  - You configure: tile size, precision, pipeline depth, TMA policy
+  - CUTLASS generates the kernel with all the same optimizations
+  - Much less code, much easier to maintain
+
+Hand-tuned MMA:   ~98-100% Tensor Core utilization
+CUTLASS GEMM:     ~95-98% Tensor Core utilization
+                   ↑
+                  "a few percent" difference
+
+CUTLAS subset of CUBLAS subset of PyTorch
+
+Agent: Iteratively decide if CUTLASS is sufficient or you generate an optimized MMA kernel yourself. 
+
+

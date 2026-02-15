@@ -115,3 +115,20 @@ Kernel Fusion:
 - CUTLASS, Triton, TorchInductor help write fused kernels with Tensor Cores + TMA + TMEM
 
 Structured Sparsity: 
+- 2:4 structured sparsity = exactly 2 of every 4 weights are zero → hardware skips zeros, doubles Tensor Core throughput
+- Applied post-training (pruning) for inference only — training gradients don't benefit
+- Sparse Tensor Cores operate on half-width data, doing 2× work per cycle on nonzero elements
+- Increases AI by cutting memory traffic ~50% (don't load zeros) while keeping same useful FLOPs
+- PyTorch: to_sparse_semi_structured() converts dense → 2:4 sparse format for Sparse Tensor Cores
+- Needs large matmuls + large batches to amortize index/compression overhead — small batches see less benefit
+- Only 2:4 pattern is hardware-accelerated — arbitrary sparsity gets no special acceleration
+- Apply AFTER basic optimizations (coalescing, tiling, fusion) are already in place
+
+Recomputation vs. Memory Trade-Off: 
+- Calculate x^2 twice instead of storing and reading it as memory is expensive. 
+
+PyTorch and Arithmetic Intensity: 
+- PyTorch auto-fuses elementwise ops via torch.compile and uses cuDNN/cuBLAS for tiled matmuls — you get tiling, fusion, shared memory for free
+- SDPA dispatches to FlashAttention/cuDNN automatically — control with sdpa_kernel(SDPBackend.FLASH_ATTENTION)
+- Prefer high-level ops (torch.matmul, nn.functional) over many small kernels — libraries call optimized fused kernels
+- Custom/nonstandard ops may not get auto-fused — manual optimization still needed for those

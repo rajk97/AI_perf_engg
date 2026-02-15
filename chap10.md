@@ -170,3 +170,93 @@ Small kernels -- no warp specialization why?
 
 __syncthreads():  block-level barrier — ALL warps in the block must arrive before ANY proceed.
 Pipeline API:     stage-level barrier — only warps involved in THAT stage wait, others keep running.
+
+- Naive tiling → double buffering = 2× speedup (overlap load+compute). Double buffering → warp specialization = ~10% more (finer sync).
+- Warp specialization: 96% SM utilization vs 92% (double buffering) vs 68% (naive) — gains come from eliminating block-wide stalls.
+- Warp specialization scales to 64 warps/SM (Blackwell limit). Double buffering saturates at ~6 warps/SM. Naive at 2-3 warps/SM.
+- Compute warp acts as BOTH consumer (of loader's data) AND producer (of results for storer) — calls consumer_wait then producer_commit in sequence.
+- Double buffering = best for simple tiled GEMMs. Warp specialization = best for irregular/deep pipelines (e.g., fused attention kernels like FlashAttention v3).
+- Diminishing returns: the big win is naive→double buffering (2×). Warp specialization adds ~10% on top — worth it only for long-running/persistent kernels.
+
+Double buffering — block-wide stall:
+  
+  ALL warps: [async load tile 1] → [consumer_wait — ALL STALL] → [compute tile 0] → [consumer_wait — ALL STALL]
+                                          ↑
+                                    if load takes 400 cycles,
+                                    ALL warps idle for 400 cycles
+                                    compute units idle, store units idle
+
+Warp specialization — only compute stalls:
+
+  Loader:  [load tile 1][load tile 2][load tile 3]...  ← keeps memory pipe busy
+  Compute: [wait 400cy][compute 0][compute 1]...       ← stalls, but only this warp
+  Storer:  [store prev][store prev]...                 ← keeps store pipe busy
+                ↑
+          loader is FILLING the next buffer during compute's stall
+          → by the time compute finishes tile 0, tile 1 is ALREADY in shared mem
+          → compute never stalls again after ramp-up
+The real advantage isn't just "fewer warps stall" — it's that the loader stays ahead
+
+DOUBLE BUFFERING (load takes longer than compute):
+══════════════════════════════════════════════════
+
+  All warps do BOTH load + compute (same job, block-wide sync)
+
+  Time:    0    100   200   300   400   500   600   700   800   900
+           |     |     |     |     |     |     |     |     |     |
+  DMA:     [====LOAD tile 0====]  [====LOAD tile 1====]  [====LOAD tile 2====]
+  Warps:                          [COMP 0]                [COMP 1]
+                                  ↑       ↑               ↑       ↑
+                            data ready   done,       data ready   done,
+                                         but tile 1               but tile 2
+                                         not ready yet!           not ready yet!
+  
+  Warps:   IDLE IDLE IDLE IDLE    BUSY    IDLE IDLE IDLE   BUSY    IDLE IDLE IDLE
+           ←── waiting for ──→            ←── waiting ──→          ←── waiting ──→
+               tile 0 load                    tile 1 load              tile 2 load
+
+  Problem: compute finishes fast, but ALL warps sit idle waiting for next tile.
+  Why: consumer_wait() is block-wide → every warp must wait, even if unrelated.
+  Hardware impact: compute units IDLE during wait, memory pipe IDLE during compute.
+  Result: memory and compute are OUT OF PHASE — never busy at the same time.
+
+
+WARP SPECIALIZATION (same workload):
+════════════════════════════════════
+
+  Each warp has ONE dedicated job, per-stage sync (only relevant warp waits)
+
+  Time:    0    100   200   300   400   500   600   700   800   900
+           |     |     |     |     |     |     |     |     |     |
+  Loader:  [====LOAD tile 0====][====LOAD tile 1====][====LOAD tile 2====]
+                                 ↑ starts immediately, no waiting!
+  
+  Compute:  waiting...          [COMP 0]  waiting   [COMP 1]  waiting  [COMP 2]
+                                 ↑ only this warp pauses
+  
+  Storer:   waiting...                    [STORE 0]           [STORE 1]
+                                           ↑ runs while compute waits
+
+  Key: loader NEVER stops → always one tile ahead
+       while compute waits, loader + storer keep memory pipe busy
+       only 1 warp idle at a time, not ALL warps
+  Why: pipeline API syncs per-stage → only consumer of THAT stage waits.
+  Hardware impact: memory pipe + compute units busy SIMULTANEOUSLY (in-phase).
+  Result: ~96% SM utilization vs ~92% for double buffering.
+
+
+WHEN TO USE WHICH:
+══════════════════
+
+  compute time ≥ load time:  double buffering ≈ warp specialization (both overlap well)
+  load time > compute time:  warp specialization wins (loader stays ahead, no block stall)
+  small kernel / few tiles:  double buffering (warp specialization overhead not worth it)
+  persistent / deep pipeline: warp specialization (overhead amortized over many iterations)
+
+PyTorch, CUDA Pipeline API, and Warp Specialization
+- torch.compile generates Triton kernels with pipeline barriers + warp specialization automatically — you don't write CUDA Pipeline API code yourself.
+- scaled_dot_product_attention fuses 3 kernels (QK matmul → softmax → PV matmul) into one warp-specialized kernel — eliminates global memory round trips between stages.
+- Under the hood: loader warps fetch tiles, compute warps process, storer warps write back — same pattern as handwritten CUDA pipeline.
+- Even FlashAttention-3 reaches only ~75% peak FP16 FLOPS with warp specialization — 100% utilization isn't needed to be well-optimized.
+- Warp specialization scales nearly linearly across warps until SMs or memory bandwidth saturate.
+

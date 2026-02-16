@@ -647,3 +647,117 @@ Now, 4 blocks run per wave. What do they touch?
   - Without this flag → launch fails silently or returns error
 - "Non-portable" = your code won't run on all cluster-capable GPUs
   - Like using architecture-specific features — works on target hardware, breaks on others
+
+=== DSMEM Sharing (what this code does) ===
+
+  Leader block (rank 0) loads tile ONCE into its own SMEM:
+
+  HBM ──────► Leader's SMEM (A_tile, B_tile)
+               (1 global load)
+
+  cluster.sync()  ← Makes leader's SMEM visible to all
+
+  Then followers read leader's SMEM via DSMEM network:
+
+  Leader's SMEM ──► Follower 0 reads via map_shared_rank()  ──► Computes
+                ──► Follower 1 reads via map_shared_rank()  ──► Computes
+                ──► Follower 2 reads via map_shared_rank()  ──► Computes
+
+  Data lives in 1 copy (leader's SMEM). Followers read REMOTELY over DSMEM.
+  Every read by a follower = on-chip SM-to-SM transfer.
+
+
+=== TMA Multicast (what chapter covered earlier) ===
+
+  TMA engine loads tile ONCE from HBM, COPIES into every block's SMEM:
+
+  HBM ──► TMA engine ──► Block 0 SMEM (local copy)
+                     ──► Block 1 SMEM (local copy)
+                     ──► Block 2 SMEM (local copy)
+                     ──► Block 3 SMEM (local copy)
+
+  Data lives in N copies (one per block). Each block reads LOCALLY from own SMEM.
+  No remote reads needed after the initial multicast.
+
+
+=== Side-by-Side ===
+
+                    DSMEM sharing              TMA multicast
+                    ──────────────             ─────────────
+  SMEM used         1× (leader only)           N× (one per block)
+  After load        Followers read remotely     Everyone reads locally
+  Each read cost    SM-to-SM (on-chip, fast     Local SMEM (~20 cy)
+                    but slower than local)
+  Sync needed       cluster.sync() before       No sync needed after
+                    map_shared_rank()            multicast completes
+  Best when         SMEM is tight OR            Tile reused many times
+                    small cluster (2-4)          OR large cluster (8-16)
+                    OR tile read once            → amortize N copies
+
+
+=== Why Choose One Over the Other? ===
+
+  Scenario: 2-block cluster, large tile, each block reads tile once
+  → DSMEM wins: 1 SMEM copy, 1 remote read each, saves SMEM ✅
+
+  Scenario: 8-block cluster, small tile, each block reads tile 100 times
+  → TMA multicast wins: 8 local copies, but 800 reads are all local SMEM speed ✅
+    (vs 800 remote DSMEM reads which are slower per access)
+
+
+=== The Code's Warp Roles ===
+
+  Within each block (3 warps):
+
+  ┌─────────────────────────────────────────────┐
+  │ Leader block (rank 0):                      │
+  │   Warp 0 (loader): async copy HBM → SMEM   │
+  │   Warp 1 (compute): read own SMEM, compute  │
+  │   Warp 2 (storer): write results to HBM     │
+  ├─────────────────────────────────────────────┤
+  │ Follower blocks (rank 1, 2, ...):           │
+  │   Warp 0: idle (no loading needed)          │
+  │   Warp 1 (compute): read leader's SMEM      │
+  │            via map_shared_rank() over DSMEM  │
+  │   Warp 2 (storer): write results to HBM     │
+  └─────────────────────────────────────────────┘
+
+  Timeline:
+  ┌──────────┐  cluster   ┌──────────┐  cluster  ┌──────────┐
+  │ Leader   │  .sync()   │ All      │  .sync()  │ Leader   │
+  │ loads    │──────────►│ compute  │─────────►│ loads    │ ...
+  │ tile N   │            │ tile N   │           │ tile N+1 │
+  └──────────┘            └──────────┘           └──────────┘
+
+=== Warp Specialization + Clusters: The Key Win ===
+- Single-block warp specialization: each block loads its OWN tiles → duplicate loads when blocks need same data
+- Cluster version: leader loads tile ONCE → all blocks read via DSMEM → no duplicate HBM loads
+
+=== Performance Progression (same GEMM workload) ===
+  Naive tiling       → 41.3 ms  (baseline)
+  Double buffered    → 20.5 ms  (2× faster, overlap load+compute)
+  Warp specialized   → 18.4 ms  (+10% over double buffer, dedicated warp roles)
+  Cluster pipeline   → 17.2 ms  (+6.5% over warp spec, eliminate duplicate loads)
+
+  Warp efficiency:  68% → 92% → 96% → 97%
+  L2 throughput:    80 → 155 → 165 → 170 GB/s
+
+=== Why Cluster Helps Even When Occupancy Looks Similar ===
+- Both hit same 64-warp/SM ceiling
+- Difference is memory behavior, not warp count:
+  - Single-block: block finishes early → immediately loads next tile → might duplicate another block's load
+  - Cluster: block finishes early → waits at `consumer_wait()` for leader's single shared load
+  - Result: fewer duplicate loads, smoother pipeline, better HBM utilization
+
+=== Pipeline Scope Gotcha ===
+- `cuda::pipeline` is block-scoped: `producer_commit()` in block 0 does NOT release `consumer_wait()` in block 1
+- Cross-block coordination: leader commits → `cluster.sync()` → followers read via `map_shared_rank()`
+- The pipeline syncs WITHIN a block, `cluster.sync()` syncs ACROSS blocks
+
+=== Gain Depends On ===
+- Tile reuse across blocks (high reuse → bigger win)
+- Cluster size and SMEM pressure
+- Both designs bounded by same limits (warps, registers, SMEM)
+
+chap10 complete. 
+  

@@ -397,3 +397,253 @@ Thread Block Clusters and Distributed Shared Memory (DSMEM):
   - Provides the foundation for efficient warp specialization
 
 - Key shift: shared memory was per-block only → DSMEM makes it per-cluster
+
+=== THREAD BLOCK SWIZZLING: THE FULL PICTURE ===
+
+Matrix multiply: C = A × B    (each 4×4 tiles)
+
+To compute one tile of C:
+  C_ij = row_i(A) · col_j(B)
+
+  So C_ij touches a HORIZONTAL strip of A and a VERTICAL strip of B:
+
+       A                    B
+  ┌──────────┐        ┌──────────┐
+  │          │        │    ↓     │
+  │→→→→→→→→→│ row i  │    ↓     │ col j
+  │          │        │    ↓     │
+  │          │        │    ↓     │
+  └──────────┘        └──────────┘
+
+
+Now, 4 blocks run per wave. What do they touch?
+
+=== ROW-MAJOR: 4 blocks in same row of C ===
+
+  C:  [██ ██ ██ ██]  ← wave 1 (C00, C01, C02, C03)
+      [            ]
+      [            ]
+      [            ]
+
+  What wave 1 touches:
+
+       A                         B
+  ┌──────────┐             ┌──────────┐
+  │██████████│ row 0 ×4    │██ ██ ██ ██│
+  │          │  (shared!)  │██ ██ ██ ██│ ALL 4 columns
+  │          │             │██ ██ ██ ██│ (each block needs
+  │          │             │██ ██ ██ ██│  a different one)
+  └──────────┘             └──────────┘
+   1 strip ✅               4 strips ❌
+                            = entire B!
+
+  L2 holds 4 strips. We loaded 1 + 4 = 5. B overflows.
+  Next wave needs same B columns → reload from HBM every time.
+
+
+=== SWIZZLED: 4 blocks in a 2×2 square of C ===
+
+  C:  [██ ██      ]  ← wave 1 (C00, C01, C10, C11)
+      [██ ██      ]
+      [            ]
+      [            ]
+
+  What wave 1 touches:
+
+       A                         B
+  ┌──────────┐             ┌──────────┐
+  │██████████│ row 0       │██ ██     │
+  │██████████│ row 1       │██ ██     │ only 2 columns
+  │          │             │██ ██     │
+  │          │             │██ ██     │
+  └──────────┘             └──────────┘
+   2 strips                 2 strips
+              total = 4 strips → fits L2 perfectly ✅
+
+
+=== WAVE-BY-WAVE COMPARISON ===
+
+  ROW-MAJOR:                         SWIZZLED:
+  Wave  A loads  B loads  Total      Wave  A loads  B loads  Total
+  ────  ───────  ───────  ─────      ────  ───────  ───────  ─────
+   1    1 (new)  4 (new)  = 5         1    2 (new)  2 (new)  = 4
+   2    1 (new)  4 (reload!) = 5      2    0 (L2!)  2 (new)  = 2
+   3    1 (new)  4 (reload!) = 5      3    2 (new)  2 (reload) = 4
+   4    1 (new)  4 (reload!) = 5      4    0 (L2!)  2 (new)  = 2
+                          ────                               ────
+                     Total: 20                          Total: 12
+
+  Savings: 8 loads = 40% less HBM traffic
+
+
+=== WHY SWIZZLED REUSES A ACROSS WAVES ===
+
+  Wave 1          Wave 2           ← same row-band!
+  ┌─────┐         ┌─────┐
+  │C00 C01│       │C02 C03│       Same A rows 0,1 needed
+  │C10 C11│       │C12 C13│       → still in L2 from wave 1 ✅
+  └─────┘         └─────┘
+  A: rows 0,1     A: rows 0,1 ← HIT
+  B: cols 0,1     B: cols 2,3 ← new, but only 2
+
+
+=== GROCERY STORE ANALOGY ===
+
+  Row-major:                  Swizzled:
+  ┌─┬─┬─┬─┬─┬─┐              ┌─┬─┬─┬─┬─┬─┐
+  │1│2│3│4│5│6│ aisles        │1│2│3│4│5│6│ aisles
+  │ │ │ │ │ │ │               │ │ │ │ │ │ │
+  │•│•│•│•│ │ │ grab 1 item   │•│•│ │ │ │ │ grab ALL items
+  │ │ │ │ │ │ │ from 4 aisles │•│•│ │ │ │ │ from 2 aisles
+  └─┴─┴─┴─┴─┴─┘              └─┴─┴─┴─┴─┴─┘
+  Walk entire store ❌        Stay nearby ✅
+  Nothing in your cart         Next trip: aisles 3,4
+  helps next trip              but aisle-1,2 stuff still in cart!
+
+
+=== ONE-LINER ===
+
+  "Make each wave's footprint a SQUARE on C, not a LINE"
+  → squares touch less of A and B → fits in L2 → reuse across waves
+
+- Thread block swizzling = remap block IDs so each wave's C tiles form a square → both A and B strips fit in L2
+  - Double-digit perf gains for persistent/tiled GEMM by reducing L2 misses
+
+- Clusters let a subset of blocks sync + share state without locking the entire GPU
+  - Remaining SMs stay free for other work
+
+- DSMEM = `__shared__` memory extended across all blocks in a cluster
+  - Logically stitches each block's shared memory into one distributed on-chip buffer
+  - Cross-block data exchange at SM-to-SM speed, no HBM round trips
+  - Increases effective arithmetic intensity (intermediate results stay on-chip)
+  - Ideal for: attention mechanisms, reductions, multistage LLM pipelines
+
+- Max portable cluster size = 8 blocks (up to 16 with `cudaFuncAttributeNonPortableClusterSizeAllowed`)
+
+- Scratch memory = hidden on-chip SRAM the GPU uses to track cluster metadata
+  - Barrier counters, DSMEM access flags, sync progress — you never touch it directly
+  - Makes `cluster.sync()` and DSMEM operations fast
+  - If metadata overflows scratch SRAM → spills to local memory (backed by L1/L2)
+
+- DSMEM = what you use (data sharing), scratch memory = what makes it fast (metadata)
+
+- Launching clusters:
+  - Use `cudaLaunchKernelEx` with `cudaLaunchConfig_t` (replaces `<<<grid, block>>>`)
+  - Set `cudaLaunchAttributeClusterDimension` (e.g. `.clusterDim.x = 2` → pairs of blocks)
+  - Grid of 128 blocks with clusterDim=2 → 64 clusters of 2 blocks each
+  - Runtime guarantees paired blocks are co-scheduled on nearby SMs for DSMEM access
+
+=== Cluster API Basics ===
+- `cg::this_cluster()` → returns `cluster_group` handle for all blocks in the cluster
+- `cluster.block_rank()` → this block's ID within the cluster (0, 1, 2...)
+- `cluster.num_blocks()` → total blocks in the cluster
+- Runtime guarantees all blocks are resident simultaneously (or launch fails)
+
+=== Cluster Sync ===
+- `cluster.sync()` = hardware barrier across all blocks in the cluster
+  - Lower latency than `grid.sync()` (only coordinates cluster blocks, not entire grid)
+  - No deadlock risk — all blocks guaranteed resident before any runs
+  - Unlike `__syncthreads()` which is block-only, this is cluster-wide
+
+=== DSMEM Access ===
+- Each block declares `extern __shared__` with same size → hardware stitches into one virtual address space
+- `cluster.map_shared_rank(shared_buffer, target_rank)` → pointer to another block's shared memory
+  - Reads/writes through this pointer go over on-chip DSMEM network (not HBM, not L2)
+  - Supports regular loads/stores AND atomics (e.g. `atomicAdd`)
+  - All at on-chip speed
+
+- Coalescing matters for DSMEM too:
+  - Align accesses to 32-byte sectors, just like global memory coalescing
+  - Each warp should touch a unique, aligned range to avoid bank conflicts
+
+=== Pattern: Cross-Block Reduction via DSMEM ===
+- Each block computes a local result in its own shared memory
+- `cluster.sync()` → all blocks done writing
+- Non-zero blocks atomicAdd their result into block 0's shared memory via `map_shared_rank`
+- `cluster.sync()` → all atomics complete
+- Block 0 reads the final combined result
+- Entire operation stays on-chip — zero HBM traffic
+
+- Thread block pair = cluster of exactly 2 blocks on 2 nearby SMs in the same GPC
+  - Effectively doubles tile size: each SM handles half the tile
+  - Each block loads a fraction (e.g. 128×16) into SMEM, holds partial accumulator (e.g. 128×256) in TMEM
+
+- Why pair? Single block may lack registers/SMEM for a large tile (e.g. 256×256)
+  - Pairing splits the work while DSMEM keeps data sharing on-chip
+
+- CUTLASS integration:
+  - Exposed as 2-SM UMMA (Unified MMA) GEMM
+  - If your requested tile size exceeds single-block capacity → CUTLASS auto-allocates a CTA pair
+  - Handles cluster launch, DSMEM setup, and `cluster.sync()` automatically
+
+=== TMA Multicast + DSMEM ===
+
+- TMA multicast: 1 global memory load → broadcast into SMEM of ALL blocks in the cluster
+  - Configured via tensor-map descriptor, issued as `cp.async.bulk.tensor` targeting `shared::cluster`
+  - CUTLASS/cuTe/Triton generate these for you
+
+- Without DSMEM:                    With DSMEM:
+  CTA 0: load tile from HBM          CTA 0: load tile from HBM
+  CTA 1: load SAME tile from HBM     CTA 1: reads CTA 0's copy via DSMEM
+  = 2 HBM loads ❌                   = 1 HBM load ✅ (multicast to both)
+
+- Real numbers (2-block cluster):
+  Global loads:    2× → 1×
+  L2 hit rate:     50% → 85%
+  DRAM BW/CTA:     300 → 150 GB/s (50% less)
+  Kernel speedup:  ~40%
+
+=== DSMEM vs L2: Two Parallel Paths ===
+
+  ┌───────┐  DSMEM network  ┌───────┐
+  │ SM 0  │◄───────────────►│ SM 1  │   ← On-chip, dedicated, ultra-fast
+  │(CTA 0)│                 │(CTA 1)│
+  └───┬───┘                 └───┬───┘
+      │                         │
+      └──────────┬──────────────┘
+                 ▼
+            ┌─────────┐
+            │   L2    │   ← Fallback if tile evicted from DSMEM
+            └────┬────┘
+                 ▼
+            ┌─────────┐
+            │   HBM   │   ← Last resort
+            └─────────┘
+
+  - DSMEM bypasses L2 — uses dedicated SM-to-SM interconnect
+  - If tile evicted from DSMEM → falls back to L2 (not straight to HBM)
+  - Both paths work in parallel
+
+=== Use Cases Beyond GEMM ===
+- Multi-block reductions/scans:
+  - Each block writes partial result to DSMEM
+  - Reduce on-chip via `cluster.sync()` → only final result goes to HBM
+  - No extra kernel launch needed
+
+- Deadlock due to branching is still possible with clusters based synchronization. 
+
+=== New Insights Only ===
+- `cluster.sync()` has same deadlock rules as warp intrinsics (`__shfl_sync()`)
+  - All blocks must reach the barrier — if one takes a different branch → deadlock
+  - Structure code so every block hits every `cluster.sync()` in unison
+
+- Best results when each block does substantial independent work between syncs
+  - Very fine-grained sharing may not pay off (sync overhead is low but nonzero)
+
+- Start with small clusters (2 or 4 blocks) unless you need more
+  - Larger clusters (e.g. 16) monopolize more SMs → reduces occupancy for other work
+
+- Good use cases:
+  - Block-sparse matrix ops (sparse attention, pruning) → share boundary data
+  - Multiphase reductions (softmax, layer norm) → combine partial results on-chip
+  - Large GEMMs exceeding single-block resources
+
+- Profile with Nsight Compute launch statistics + `cudaOccupancyMaxActiveBlocksPerMultiprocessor`
+
+=== What is Non-Portable Cluster Size? ===
+- Portable cluster size = up to 8 blocks → guaranteed to work on ALL GPUs that support clusters
+- Non-portable cluster size = 9-16 blocks → only works on specific GPUs (e.g. Blackwell)
+  - Must explicitly enable: `cudaFuncAttributeNonPortableClusterSizeAllowed`
+  - Without this flag → launch fails silently or returns error
+- "Non-portable" = your code won't run on all cluster-capable GPUs
+  - Like using architecture-specific features — works on target hardware, breaks on others

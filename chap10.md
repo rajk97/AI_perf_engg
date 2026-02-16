@@ -260,3 +260,140 @@ PyTorch, CUDA Pipeline API, and Warp Specialization
 - Even FlashAttention-3 reaches only ~75% peak FP16 FLOPS with warp specialization — 100% utilization isn't needed to be well-optimized.
 - Warp specialization scales nearly linearly across warps until SMs or memory bandwidth saturate.
 
+2/16/26:
+- Persistent kernel = launch ONE long-running kernel instead of 1000 small ones → eliminates launch overhead (20ms saved in example).
+- Threads loop, grabbing tasks via atomicAdd on a global counter — no exit/relaunch between tasks.
+- 1000 tiny kernels: ~35% GPU utilization (SMs idle between launches). Persistent kernel: ~100% SMs active.
+- Queue = pre-filled task array in device memory + atomic counter. CPU fills before launch, GPU threads consume.
+- For continuous work: CPU writes tasks + signals via flag, GPU polls — needs system-scope memory fences on unified memory.
+- Persistent kernels pair well with TMA: some warps prefetch next task's data while others compute current task.
+- Low per-SM occupancy (12% in example) is fine — the point is ALL SMs stay active, not max warps per SM.
+
+- Persistent kernels shine for many small/uneven tasks — dynamic load balancing via atomic counter, faster threads grab more work, no SM goes idle early.
+- Common workloads: graph traversals, batched transforms, per-token LLM inference — anything with variable task sizes.
+- Downsides: atomic contention on shared counter, harder to debug (one bad thread hangs entire kernel), can monopolize GPU blocking other work.
+- 2-3× throughput vs naive separate kernels by eliminating launch overhead and keeping all SMs busy.
+- PyTorch doesn't auto-fuse into persistent megakernels yet — requires custom CUDA or specialized compilers.
+- Megakernel = persistent kernel that fuses multiple pipeline stages into one kernel, keeping data on-chip across stages.
+
+Persistent Kernels and Warp Specialization:
+- Persistent kernels + warp specialization = natural pairing: long-running loop amortizes warp role setup, deeper pipeline stays full across many tasks.
+- "Short kernels don't benefit" = few loop iterations can't amortize pipeline ramp-up/drain overhead — use simple double buffering instead.
+- Dynamic load balancing: each block grabs next task via atomicAdd — faster blocks process more tasks, no SM sits idle.
+- Limitation: persistent kernel must find enough free SMs to launch — if other kernels occupy SMs, resources may not be available.
+- Thread block clusters (next topic) help by grouping blocks across nearby SMs for persistent kernels.
+
+Cooperative Groups:
+- Cooperative Groups = sync threads at any granularity: tile (sub-warp), block, cluster (multi-block), or entire grid.
+- grid.sync() = global barrier across ALL blocks — impossible with normal __syncthreads().
+- Enables multi-phase algorithms in a single persistent kernel — no exit/relaunch between phases.
+- Must launch with cudaLaunchCooperativeKernel() — CUDA guarantees all blocks fit on GPU simultaneously (otherwise launch fails).
+- Size grid using cudaOccupancyMaxActiveBlocksPerMultiprocessor to avoid launch failure.
+
+So "nonexistent blocks" = blocks that haven't launched yet because they're queued, waiting for SMs to free up. Cooperative launch prevents this by refusing to launch if all blocks can't fit -- basically, deadlock -- grid.sync() for all blocks but if all blocks aren't launched, there's deadlock right -- this is avoided. 
+
+- cooperative launch grid size = SMs × max_blocks_per_SM (e.g. 132 × 4 = 528)
+- exceed that limit → launch fails (not a silent bug, it just returns an error)
+- use `cudaOccupancyMaxActiveBlocksPerMultiprocessor` to calculate safe grid size
+- always check `cudaLaunchCooperativeKernel` return status
+
+- pre-Blackwell cross-block coordination = global memory atomics/flags
+  - works but forces intermediate data through HBM → extra traffic
+- Blackwell alternative = thread block clusters + DSMEM
+  - share data in on-chip SRAM, sync without global memory round trips
+
+- use cooperative kernels when:
+  - you need a true all-block barrier in a single launch
+  - you want intermediate results to stay in fast memory (regs/shmem)
+
+- downsides:
+  - grid size capped by GPU concurrent block capacity
+  - may force fewer, larger blocks
+  - if ANY thread skips `grid.sync()` (e.g. divergent if) → deadlock
+  - `grid.sync()` is heavyweight (coordinates across all SMs)
+    - use sparingly, do significant work between calls
+
+- for limited cross-block coordination:
+  - global atomics / per-block flags = simpler, safer than full grid barrier
+  - but less efficient than thread block clusters + DSMEM
+
+- Persistent kernel + cooperative groups = best of both worlds
+  - Persistent loop stays on GPU (no relaunch overhead)
+  - `grid.sync()` provides global barrier between stages (no host sync needed)
+
+- Example: 2 stages × 1000 iterations
+  - Naive: 2000 kernel launches (launch overhead each time)
+  - Cooperative persistent: 1 launch, `grid.sync()` between stages inside loop
+
+- Pattern:
+  - Stage 1: All blocks process dataA (grid-stride loop)
+  - `grid.sync()` ← Every block finishes Stage 1 before any starts Stage 2
+  - Stage 2: All blocks use finished dataA to update dataB
+  - `grid.sync()` ← Barrier before next iteration
+
+- Host side:
+  - Check `prop.cooperativeLaunch` support
+  - `cudaOccupancyMaxActiveBlocksPerMultiprocessor` → Get max blocks/SM
+  - Clamp grid size to `maxBlocksPerSM × SM_count`
+  - Launch with `cudaLaunchCooperativeKernel`
+
+- Data locality across `grid.sync()`:
+  - Per-thread data stays in registers
+  - Per-block data stays in shared memory
+  - Cross-block exchange → Global memory (or clusters + DSMEM on Blackwell)
+
+- Ideal for: Multistep LLM inference (e.g. reduction/norm → per-element transform)
+  - Eliminates all inter-kernel round trips
+  - Maximizes on-chip data reuse
+
+- Best practice: 1 thread block per SM for persistent kernels (if resources allow)
+  - Each SM has a resident block that loops over a work queue
+  - Use `grid.sync()` to coordinate between phases
+
+- Decision guide:
+  - Multiple phases needing global sync? → Cooperative kernel
+  - Many small/irregular tasks with launch overhead? → Persistent kernel
+  - Can reserve entire grid exclusively? → Cooperative + persistent (best perf)
+  - Need to share SMs with other work? → Thread block clusters instead
+
+- Key caveat: Cooperative kernels reserve ALL SMs in the grid
+  - No other kernels can run concurrently on those SMs
+  - If you need co-scheduling (e.g. async prefetch, lower-priority inference)
+    → Partition GPU using thread block clusters
+
+Thread Block Clusters and Distributed Shared Memory (DSMEM):
+- Cooperative groups = software abstraction for syncing any grouping of threads (warps, tiles, blocks, grids)
+- Thread block clusters (CTA clusters) = hardware-level hierarchy
+  - GPU co-schedules a cluster's blocks on the same GPC (group of nearby SMs)
+  - Only reserves a subset of SMs → remaining SMs free for other kernels
+  - Unlike cooperative kernels which monopolize all SMs
+
+- GPC = collection of nearby SMs: GPU Processing Cluster
+  - GPU schedules cluster blocks onto a GPC like it schedules threads onto an SM
+  - Blackwell B200: 2 GPC partitions (one per die), linked by NV-HBI
+    - Coherent L2 across dies → appears as single logical GPC to software
+
+- DSMEM (distributed shared memory):
+  - On-chip SRAM shared across all blocks in a cluster
+  - Low-latency cross-block communication without going through HBM
+  - Native hardware support
+
+- `cluster.sync()` = barrier for only the blocks in that cluster
+  - Lighter than `grid.sync()` (which blocks every block on every SM)
+  - Lets you synchronize a subset of blocks without stalling the whole GPU
+
+- Thread block clusters subdivide the grid into smaller cooperative groups
+  - Each cluster can share data via DSMEM and sync via `cluster.sync()`
+  - Blocks outside the cluster are unaffected
+
+- Without clusters: cross-block communication required global memory + `grid.sync()`
+  - Both are slow → bottleneck for fine-grained cross-block cooperation
+- With clusters: blocks in a cluster share data via DSMEM (on-chip) + sync via `cluster.sync()`
+  - Hardware-supported barriers (PTX instructions + CUDA intrinsics) → much faster than `grid.sync()`
+
+- Cluster launch control = hardware mechanism that:
+  - Schedules persistent thread block clusters
+  - Maintains balanced load even when some SMs are occupied by other work
+  - Provides the foundation for efficient warp specialization
+
+- Key shift: shared memory was per-block only → DSMEM makes it per-cluster

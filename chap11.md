@@ -221,3 +221,469 @@ For LLMs:
   - Need to reallocate/extend scratch buffer as sequence gets longer
   - cudaMallocAsync lets you grow the buffer in the same stream as the attention kernel
   - Other streams (data loading, result copying) keep running in parallel
+
+2/17/26:
+
+- Layerwise pipelining: split LLM across streams (e.g. stream 0 = layers 0-5, stream 1 = layers 6-11)
+  - Stream 0 finishes batch N → allocs scratch for batch N+1 via cudaMallocAsync
+  - Stream 1 keeps computing layers 6-11 on batch N's results — no stall
+  - cudaMalloc would pause BOTH streams for every alloc → pipeline broken
+
+- "Scratch buffer" = umbrella term for ALL temporary buffers in LLM:
+  - Attention intermediates (Q×K^T scores)
+  - LayerNorm temporaries
+  - Softmax temporaries
+  - KV cache
+  - Intermediate activations between layers
+
+Legacy Default Stream:
+- Stream 0 (legacy default) = global serializer
+  - Everything in stream 0 runs one-after-another (no overlap within)
+  - AND it blocks ALL other streams:
+    - Op goes into stream 0 → waits for ALL other streams to finish first
+    - Op goes into any other stream → waits for stream 0 to finish first
+  - Effectively a device-wide barrier every time you touch stream 0
+
+- This kills ALL concurrency:
+  - No kernel-kernel overlap
+  - No kernel-copy overlap
+  - Copy engines sit idle while kernels run and vice versa
+
+- Rule: never use stream 0 unless you explicitly need global serialization (rare)
+  - Always create explicit streams with cudaStreamCreateWithFlags
+
+Modern Per-Thread Default Stream:
+- Per-thread default stream (PTDS) = each CPU thread gets its OWN independent "stream 0"
+  - Thread A's default stream doesn't block thread B's default stream
+  - Full concurrency between threads without explicitly creating streams
+
+- Enable via:
+  - Compile: `nvcc --default-stream per-thread`
+  - Env var: `CUDA_API_PER_THREAD_DEFAULT_STREAM=1` (before CUDA headers)
+
+- Legacy stream 0: 1 global stream shared by all threads → global barrier
+- PTDS: N threads → N independent default streams → no cross-thread barriers
+
+- Caveat: if you mix PTDS with legacy stream 0 in the same process
+  → PTDS streams still sync with the legacy default stream (don't mix them)
+
+Default Versus Explicit (Nondefault) Streams:
+- `cudaStreamNonBlocking` flag = stream will NOT sync with legacy stream 0
+  - Without this flag → even explicit streams can get blocked by stream 0
+  - Always use: `cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking)`
+
+- PyTorch uses non-default streams internally:
+  - cuDNN, cuBLAS calls → own streams (avoid blocking stream 0)
+  - NCCL distributed comms → separate HIGH-PRIORITY streams
+    - Overlaps gradient communication with compute
+
+- Best practice combo:
+  - Enable PTDS (per-thread default streams)
+  - AND create explicit streams with `cudaStreamNonBlocking`
+  - Both together = zero accidental synchronization  
+
+Best Practices: 
+=== Stream Types Cheat Sheet ===
+  Legacy default (stream 0): Global barrier — blocks and is blocked by everything
+  Per-thread default (PTDS): Private per CPU thread — serializes own work, doesn't block others
+  Explicit (non-default):    Fully independent — only syncs when YOU add dependencies
+
+=== Best Practices ===
+- Never put perf-critical work on stream 0 (even 1 stray op stalls everything)
+- Some older CUDA APIs use stream 0 implicitly → migrate to newer APIs or always pass explicit stream
+- Enable PTDS for multi-threaded CPU apps
+- Create explicit streams with `cudaStreamNonBlocking` for all kernels/copies/allocs
+- Use `cudaStreamWaitEvent()` for fine-grained dependencies between streams
+  - NOT `cudaStreamSynchronize()` which stalls the whole stream
+  - Only use `cudaStreamSynchronize()` at well-defined global points (e.g. end of epoch)
+
+  Lightest:  cudaStreamWaitEvent()       → GPU-side, stream-to-stream, CPU free: 1 stream blocked/waits until another one is done
+  Medium:    cudaStreamSynchronize()     → CPU blocks on 1 stream, GPU others run -- no host side ops allowed until everything on that specific stream's queue is done. 
+  Heaviest:  cudaDeviceSynchronize()     → CPU blocks until ALL GPU work done  
+
+=== Events Summary ===
+- `cudaEventRecord(event, stream0)` = drop a marker at a point in stream 0
+- `cudaStreamWaitEvent(stream1, event)` = stream 1 pauses until that marker is reached
+- CPU never blocks, all other streams keep running
+- Only the waiting stream pauses, and only until the specific event fires
+
+=== Host Callback ===
+- `cudaLaunchHostFunc(stream, callbackFn, userData)` = run a CPU function when stream reaches this point
+- Enqueued INTO the stream like any other op — runs in order
+
+- Caveat: NEVER call CUDA APIs inside the callback → deadlock
+  (runtime thread is waiting for callback to finish, callback is waiting for runtime)
+
+- Host memory pool = pre-allocated pinned CPU memory, managed like a buffer ring
+  - Avoids repeated cudaMallocHost/cudaFreeHost OS calls (~ms each)
+  - Pool alloc/free = pointer math (~μs)
+
+- Must recycle buffers back to pool after GPU finishes with them
+  - Pool has finite slots — if you don't return, pool runs out → stall
+  - Use `cudaLaunchHostFunc` callback to recycle automatically when GPU is done
+  - No CPU polling, no device sync needed
+
+- With recycling: 3-4 pool slots can handle hundreds of batches
+- Without recycling: need one slot per batch → memory explodes  
+
+=== CUDA Events for Cross-Stream Sync ===
+- Event = lightweight marker recorded at a specific point in a stream's queue
+- Other streams call `cudaStreamWaitEvent()` to wait for that marker
+- No CPU blocking, no device-wide stall — only the waiting stream pauses
+
+- Chain events for complex dependency graphs:
+  Stream A: [produce data] → record eventA
+  Stream B: wait(eventA) → [process data] → record eventB
+  Stream C: [independent work, runs freely]
+  Stream D: wait(eventB) → [consume results]
+
+- Real-world use in LLM training:
+  - Compute stream records event when gradients are ready
+  - NCCL communication stream waits on that event → starts all-reduce
+  - Remaining compute continues in parallel with communication
+
+- Multi-GPU pipeline parallelism:
+  - GPU 0 records event when output tensor is ready
+  - GPU 1 waits on that event before consuming it
+  - No idle time on either GPU for independent work
+
+- Events also useful for profiling (record timestamps in GPU timeline)  
+
+Pipelining with Warp Specialization (Intra-Kernel) and CUDA Streams (Inter-Kernel):
+
+=== TWO-LEVEL PIPELINE: THE BIG PICTURE ===
+
+  Level 1 (Inter-kernel): CUDA streams overlap DIFFERENT BATCHES
+  Level 2 (Intra-kernel): Warp specialization overlaps DIFFERENT TILES within one batch
+
+  Zoom levels:
+  ┌─────────────────────────────────────────────────────────────┐
+  │ LEVEL 1: Streams (batch level)                              │
+  │                                                             │
+  │ Stream 0: [upload B0][══ kernel B0 ══][download B0]         │
+  │ Stream 1:      [upload B1][══ kernel B1 ══][download B1]    │
+  │ Stream 0:                [upload B2][══ kernel B2 ══]...    │
+  │                                                             │
+  │ Copy engines + SMs + copy engines all busy simultaneously   │
+  └──────────────────────────┬──────────────────────────────────┘
+                             │
+                        zoom into one kernel
+                             │
+                             ▼
+  ┌─────────────────────────────────────────────────────────────┐
+  │ LEVEL 2: Warp specialization (tile level)                   │
+  │                                                             │
+  │ Inside "kernel B0":                                         │
+  │                                                             │
+  │ Warp 0 (loader):  [load T0][load T1][load T2][load T3]     │
+  │ Warp 1 (compute):      [compute T0][compute T1][compute T2]│
+  │ Warp 2 (storer):            [store T0][store T1][store T2]  │
+  │                                                             │
+  │ 3 warps overlap on 3 different tiles at once                │
+  └─────────────────────────────────────────────────────────────┘
+
+
+=== WHAT EACH LEVEL OVERLAPS ===
+
+  Level 1 (streams):
+  ┌──────────┐  ┌──────────┐  ┌──────────┐
+  │Copy Eng  │  │   SMs    │  │Copy Eng  │
+  │  H→D     │  │ compute  │  │  D→H     │
+  │          │  │          │  │          │
+  │ batch    │  │ batch    │  │ batch    │
+  │ N+1      │  │ N        │  │ N-1      │
+  └──────────┘  └──────────┘  └──────────┘
+  3 different hardware units, 3 different batches, all at once
+
+  Level 2 (warp specialization):
+  ┌──────────────────────────────────┐
+  │ Inside ONE kernel on ONE SM:     │
+  │                                  │
+  │  Warp 0: HBM → shared mem       │  tile N+1
+  │  Warp 1: shared mem → compute   │  tile N
+  │  Warp 2: compute → HBM          │  tile N-1
+  │                                  │
+  │  3 warps, 3 pipeline stages,     │
+  │  3 different tiles, same SM      │
+  └──────────────────────────────────┘
+
+
+=== THE DOUBLE BUFFERING INSIDE ===
+
+  Shared memory has 2 slots (ping-pong):
+
+  Slot 0: [A0 | B0 | C0]     Slot 1: [A1 | B1 | C1]
+           ↑                           ↑
+     loader fills this           loader fills this
+     while compute reads         while compute reads
+     the other one               the other one
+
+  Tile 0: loader → slot 0,  compute reads slot 0,  storer writes from slot 0
+  Tile 1: loader → slot 1,  compute reads slot 1,  storer writes from slot 1
+  Tile 2: loader → slot 0,  compute reads slot 0,  storer writes from slot 0
+           (ping)              (pong)                (ping)
+
+
+=== TWO PIPELINES INSIDE THE KERNEL ===
+
+  pipe_lc (loader → compute):        pipe_cs (compute → storer):
+
+  Loader                              Compute
+    ↓ "tile is loaded"                  ↓ "result is ready"
+  pipe_lc.producer_commit()           pipe_cs.producer_commit()
+    ↓                                   ↓
+  Compute                              Storer
+  pipe_lc.consumer_wait()             pipe_cs.consumer_wait()
+    ↓ "okay, I can read"               ↓ "okay, I can write back"
+
+  Why TWO pipelines instead of one?
+  - Loader and storer are INDEPENDENT — they don't wait for each other
+  - Compute is the bridge: consumes from loader, produces for storer
+  - Separate pipelines = maximum overlap between all three
+
+
+=== HOST DRIVER PATTERN ===
+
+  For each batch b:
+  ┌────────────────────────────────────────────────┐
+  │ Stream = s[b % 2]  (round-robin across 2)      │
+  │                                                │
+  │ 1. cudaMallocAsync  → alloc device buffers     │
+  │ 2. cudaMemcpyAsync  → upload A, B  (H→D)      │
+  │ 3. kernel<<<...>>>  → warp-specialized compute │
+  │ 4. cudaMemcpyAsync  → download C   (D→H)      │
+  │ 5. cudaFreeAsync    → free device buffers      │
+  │                                                │
+  │ All enqueued instantly, CPU moves to next batch │
+  └────────────────────────────────────────────────┘
+
+  CPU enqueues ALL batches rapidly:
+  b=0 → stream 0    b=1 → stream 1    b=2 → stream 0    b=3 → stream 1 ...
+
+  GPU executes:
+  Stream 0: [alloc|upload|kernel|download|free]     [alloc|upload|kernel|download|free]
+  Stream 1:       [alloc|upload|kernel|download|free]     [alloc|upload|kernel|download|free]
+                   ↑ overlaps with stream 0
+
+
+=== COMBINED: EVERYTHING AT ONCE ===
+
+  Time → ────────────────────────────────────────────────────────►
+
+  Copy H→D:  |batch 1 uploading |batch 2 uploading |batch 3 uploading |
+  SMs:       |batch 0 kernel    |batch 1 kernel    |batch 2 kernel    |
+  Copy D→H:       |batch -1 done|batch 0 download  |batch 1 download  |
+                                 │
+                          zoom into "batch 0 kernel":
+                                 │
+               Warp 0: [load T1][load T2][load T3]
+               Warp 1:    [compute T0][compute T1][compute T2]
+               Warp 2:        [store T0][store T1][store T2]
+
+  = Every piece of hardware busy at every moment
+  = Two levels of pipelining, fully nested
+
+=== WARP SPECIALIZATION vs DOUBLE BUFFERING: RECAP ===
+
+  Double buffering:
+  - ALL warps do the SAME job (load → compute → store)
+  - Overlap comes from 2 shared memory buffers:
+    - All warps load tile N+1 into buffer B
+    - Then all warps compute tile N from buffer A
+    - Swap buffers, repeat
+  - Sync: block-wide __syncthreads() or pipeline consumer_wait
+
+  Warp specialization:
+  - DIFFERENT warps have DIFFERENT jobs:
+    - Warp 0 = loader (always loading)
+    - Warp 1 = compute (always computing)
+    - Warp 2 = storer (always storing)
+  - Overlap comes from dedicated roles running simultaneously
+  - Sync: pipeline producer_commit / consumer_wait between warps
+
+
+=== WHAT THIS BOOK'S CODE DOES: BOTH ===
+
+  It uses warp specialization (3 warps with dedicated roles)
+  AND double buffering (2 shared memory slots, ping-pong)
+
+  Why? They solve different problems:
+
+  Warp specialization alone (1 buffer):
+  Warp 0: [load T0]         [load T1]          [load T2]
+  Warp 1:          [compute T0]       [compute T1]
+  Warp 2:                   [store T0]          [store T1]
+                    ↑ loader must WAIT for compute to finish
+                      before it can reuse the buffer ❌
+
+  Warp specialization + double buffering (2 buffers):
+  Warp 0: [load T0 → buf0][load T1 → buf1][load T2 → buf0]
+  Warp 1:                  [compute T0 ← buf0][compute T1 ← buf1]
+  Warp 2:                          [store T0][store T1]
+                    ↑ loader writes to buf1 WHILE compute reads buf0
+                      no waiting! ✅
+
+=== THE BIGGER PICTURE: EVERY LEVEL OF THE SYSTEM HAS IDLE TIME TO FILL ===
+
+  The GPU is a pipeline of pipelines. Each level eliminates a different source of idle time.
+
+  Level 0: No optimization
+  ┌──────────────────────────────────────────────────────────────┐
+  │ CPU: [upload][wait...][launch kernel][wait...][download]     │
+  │ GPU:        [idle]    [compute]      [idle]                  │
+  │ Copy:       [idle]                   [idle]                  │
+  │                                                              │
+  │ Problem: everything waits for everything else                │
+  └──────────────────────────────────────────────────────────────┘
+
+  Level 1: CUDA Streams → overlap batches across hardware engines
+  ┌──────────────────────────────────────────────────────────────┐
+  │ Copy H→D: [batch 1][batch 2][batch 3]                       │
+  │ SMs:      [batch 0][batch 1][batch 2]                       │
+  │ Copy D→H: [      ][batch 0][batch 1]                        │
+  │                                                              │
+  │ Solved: CPU↔GPU transfer latency hidden                     │
+  │ Remaining problem: INSIDE each kernel, still sequential      │
+  └──────────────────────────────────────────────────────────────┘
+
+  Level 2: Warp specialization → overlap pipeline stages within a kernel
+  ┌──────────────────────────────────────────────────────────────┐
+  │ Inside each kernel:                                         │
+  │ Loader:  [tile 1][tile 2][tile 3]                           │
+  │ Compute:    [tile 0][tile 1][tile 2]                        │
+  │ Storer:        [tile 0][tile 1][tile 2]                     │
+  │                                                              │
+  │ Solved: HBM latency hidden within a kernel                  │
+  │ Remaining problem: loader waits for buffer to free up        │
+  └──────────────────────────────────────────────────────────────┘
+
+  Level 3: Double buffering → loader never waits for compute
+  ┌──────────────────────────────────────────────────────────────┐
+  │ Loader:  [T0→buf0][T1→buf1][T2→buf0][T3→buf1]              │
+  │ Compute:     [T0←buf0][T1←buf1][T2←buf0]                   │
+  │ Storer:          [T0][T1][T2]                               │
+  │                                                              │
+  │ Solved: no warp ever waits for a shared memory buffer        │
+  └──────────────────────────────────────────────────────────────┘
+
+  Level 4: Thread block clusters + DSMEM → eliminate duplicate loads
+  ┌──────────────────────────────────────────────────────────────┐
+  │ Leader loads tile once → shares via DSMEM to all blocks      │
+  │                                                              │
+  │ Solved: multiple blocks needing same tile don't each load it │
+  └──────────────────────────────────────────────────────────────┘
+
+
+=== EACH LEVEL TARGETS A DIFFERENT BOTTLENECK ===
+
+  Bottleneck                          Solution
+  ───────────────────────────────     ──────────────────────────
+  CPU↔GPU transfer latency           Streams (overlap H2D/D2H with compute)
+  HBM→SMEM load latency              Warp specialization (dedicated loader warp)
+  Buffer contention in SMEM          Double buffering (2 slots, ping-pong)
+  Duplicate HBM loads across blocks  Clusters + DSMEM (load once, share)
+  Launch overhead across batches     Persistent kernels (one launch, loop inside)
+  Global sync overhead               Cooperative groups / cluster.sync()
+
+
+=== ONE SENTENCE ===
+
+  Streams feed the machine; warp spec + double buffering keep it full;
+  clusters eliminate waste — together they leave zero idle silicon.
+
+cp.async/cuda::memcpy_async -- DMA unit inside the SM handles HBM -> shared memory
+
+  Async load (cp.async / cuda::memcpy_async):
+  HBM → shared memory (bypasses registers)
+  - DMA unit inside the SM handles it
+  - Thread is FREE to do other work while data moves
+  - This is what the warp-specialized kernel uses ✅
+
+also, it looks like in double buffering, we create enough shared memory size so that we have 2 buffers instead of 1, right
+
+=== LOAD PATH IN WARP SPECIALIZATION ===
+
+  Two different cases:
+
+  Regular load (without async):
+  HBM → registers → shared memory
+  - Thread issues load instruction → data goes to register first → thread writes to SMEM
+  - Thread is busy during the transfer
+
+  Async load (cp.async / cuda::memcpy_async):
+  HBM → shared memory (bypasses registers)
+  - DMA unit inside the SM handles it
+  - Thread is FREE to do other work while data moves
+  - This is what the warp-specialized kernel uses ✅
+
+  So in this code:
+  Warp 0 (loader): issues cuda::memcpy_async → HBM directly to SMEM
+  Warp 1 (compute): reads from SMEM → registers → ALU/Tensor Cores
+  Warp 2 (storer): reads from SMEM → registers → writes to HBM
+
+
+=== DOUBLE BUFFERING SHARED MEMORY ===
+
+  Yes, exactly. You allocate 2× the SMEM:
+
+  Single buffer:
+  SMEM: [A | B | C]                    = 3 × TILE_SIZE × sizeof(float)
+        ↑ loader and compute fight over this
+
+  Double buffer:
+  SMEM: [A0 | B0 | C0 | A1 | B1 | C1] = 6 × TILE_SIZE × sizeof(float)
+         ↑ slot 0        ↑ slot 1
+         compute reads   loader writes
+         this one        this one
+                         (simultaneously, no conflict)
+
+  Trade-off:
+  - Uses 2× shared memory → may reduce max blocks per SM (lower occupancy)
+  - But eliminates wait time → usually worth it
+  - Must fit: 6 × 1024 × 4 = 24KB << 228KB available on Blackwell ✅ (no problem)
+
+=== WHY ASYNC MEMCPY ENABLES TRUE PARALLEL LOAD + COMPUTE ===
+
+  Regular load (ld.global):
+  - Thread issues load → thread's register is OCCUPIED waiting for data
+  - Thread is stalled (or at least its register is tied up)
+  - The warp scheduler can switch to another warp, but that warp's
+    registers/ALU slots are still held
+
+  Async load (cp.async / cuda::memcpy_async):
+  - Thread says "copy this from HBM to SMEM" → hands it off to DMA unit
+  - Thread's registers are NOT involved in the transfer
+  - DMA unit (separate hardware inside the SM) does the copy
+  - Thread is completely free → compute warp can use the ALU
+
+  ┌──────────────────────────────────┐
+  │ SM                               │
+  │                                  │
+  │  Warp 0 (loader):               │
+  │    issues cp.async → hands off   │
+  │    to DMA unit, warp does nothing│
+  │                                  │
+  │  DMA unit: [HBM → SMEM]  ←──── separate hardware, no ALU/register use
+  │                                  │
+  │  Warp 1 (compute):              │
+  │    uses ALU + registers freely   │ ← no contention with the DMA ✅
+  │    reads from SMEM (other slot)  │
+  │                                  │
+  │  Both happening simultaneously   │
+  └──────────────────────────────────┘
+
+  Without async:
+  - Load goes through registers → registers tied up → fewer available for compute
+  - ALU might be idle while waiting for load to finish
+
+  With async:
+  - Load bypasses registers entirely → DMA unit handles it
+  - ALU + registers fully available for compute warp
+  - Two different hardware paths, zero contention  
+
+Async memory transfer helps both:
+  - Double buffering: makes the overlap REAL (not just phase alternation)
+  - Warp specialization: frees loader warp's registers/ALU for compute warp
+
+async memcpy is the foundation that makes BOTH techniques actually overlap
+load and compute simultaneously, rather than just interleaving them.  

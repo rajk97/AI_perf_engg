@@ -687,3 +687,156 @@ Async memory transfer helps both:
 
 async memcpy is the foundation that makes BOTH techniques actually overlap
 load and compute simultaneously, rather than just interleaving them.  
+
+2/19/26:
+
+
+- Two-level view: CPU side (streams) and GPU side (what actually runs)
+
+  CPU SIDE — round-robin enqueue
+  ─────────────────────────────────────────────────────────
+  Stream 0:  [alloc₀][H2D₀][kernel₀][D2H₀][free₀]  [alloc₂][H2D₂][kernel₂]...
+  Stream 1:       [alloc₁][H2D₁][kernel₁][D2H₁][free₁]  [alloc₃][H2D₃]...
+                   ↑ CPU enqueues batch b into streams[b % 2]
+
+  GPU SIDE — what the hardware actually executes
+  ─────────────────────────────────────────────────────────
+  Copy engine H→D: |==H2D₀==|==H2D₁==|     |==H2D₂==|==H2D₃==|
+  SMs:             |        |==kern₀==|==kern₁==|     |==kern₂==|
+  Copy engine D→H: |        |         |==D2H₀==|==D2H₁==|      |
+                                       ↑ cooperative kernels SERIALIZE on SMs
+                                         but copies overlap with other stream's kernel
+
+- Key: cooperative/cluster kernels pin all their blocks, so kern₀ and kern₁-- basically, we use all SM's for the kernel -- no SM's left for other kernels -- so serialization on SM's
+  cannot run simultaneously — but H2D₁ overlaps kern₀, D2H₀ overlaps kern₁
+
+  INSIDE EACH KERNEL LAUNCH (e.g., kern₀)
+  ─────────────────────────────────────────────────────────
+  Grid: blocksPerGrid = numSMs × CLUSTER_BLOCKS (e.g., 160 × 4 = 640 blocks)
+
+  Grouped into clusters of 4 blocks:
+
+  ┌─────────── Cluster 0 ───────────┐  ┌─────────── Cluster 1 ───────────┐
+  │ Block 0    Block 1   Block 2   Block 3 │  │ Block 4    Block 5   Block 6   Block 7 │
+  │ (leader)   (follower)(follower)(follower)│  │ (leader)   ...                        │
+  └─────────────────────────────────┘  └─────────────────────────────────┘
+    ... up to 160 clusters (one per SM set)
+
+  INSIDE ONE CLUSTER (e.g., Cluster 0, processing tile T)
+  ─────────────────────────────────────────────────────────
+  Block 0 (leader, rank=0)          Block 1 (rank=1)       Block 2 (rank=2)       Block 3 (rank=3)
+  ┌──────────────────┐              ┌──────────────┐       ┌──────────────┐       ┌──────────────┐
+  │ W0: LOAD A,B     │──DSMEM──→   │ W0: idle     │       │ W0: idle     │       │ W0: idle     │
+  │     from HBM     │  publish    │              │       │              │       │              │
+  │     into SMEM    │             │              │       │              │       │              │
+  ├──────────────────┤              ├──────────────┤       ├──────────────┤       ├──────────────┤
+  │ W1: COMPUTE      │              │ W1: COMPUTE  │       │ W1: COMPUTE  │       │ W1: COMPUTE  │
+  │   rows 0-31      │              │   rows 32-63 │       │   rows 64-95 │       │   rows 96-127│
+  │   from leader's  │              │   from leader│       │   from leader│       │   from leader│
+  │   A,B via DSMEM  │              │   A,B DSMEM  │       │   A,B DSMEM  │       │   A,B DSMEM  │
+  ├──────────────────┤              ├──────────────┤       ├──────────────┤       ├──────────────┤
+  │ W2: STORE        │              │ W2: STORE    │       │ W2: STORE    │       │ W2: STORE    │
+  │   rows 0-31→HBM  │              │   rows 32-63 │       │   rows 64-95 │       │   rows 96-127│
+  └──────────────────┘              └──────────────┘       └──────────────┘       └──────────────┘
+       ↑ 3 warps per block (96 threads)
+       ↑ W0=loader, W1=compute, W2=storer
+
+  DATA FLOW WITHIN ONE TILE
+  ─────────────────────────────────────────────────────────
+  HBM ──W0(leader)──→ Leader's SMEM ──cluster.sync()──→ DSMEM read by all 4 blocks
+                        (A_tile, B_tile)                    via map_shared_rank(0)
+                              │
+                              ↓
+                     W1(all blocks): compute row bands → local C_tile in each block's SMEM
+                              │
+                              ↓
+                     W2(all blocks): write C_tile rows → HBM
+                              │
+                              ↓
+                     cluster.sync() → leader can reuse buffers for next tile
+
+  TILE LOOP (persistent kernel)
+  ─────────────────────────────────────────────────────────
+  Each cluster loops:  tile 0 → tile 1 → tile 2 → ... → tile numTiles-1
+                       (stride = gridDim.x / cluster_dims.x = num clusters)
+
+  So cluster 0 does tiles 0, 160, 320, ...
+     cluster 1 does tiles 1, 161, 321, ...
+
+  FULL PICTURE — one batch flowing through one stream
+  ─────────────────────────────────────────────────────────
+  cudaMallocAsync ─→ cudaMemcpyAsync(H2D) ─→ cudaLaunchKernelExC ─→ cudaMemcpyAsync(D2H) ─→ cudaFreeAsync
+       │                    │                        │                        │                    │
+       ▼                    ▼                        ▼                        ▼                    ▼
+  pool gives           copy engine             160 clusters               copy engine         pool reclaims
+  dA, dB, dC           moves data              × 4 blocks each           moves results        dA, dB, dC
+  (no sync)            to GPU                  × 3 warps/block           to host              (no sync)
+                                               warp-specialized
+                                               + DSMEM shared
+
+- The overlap win: while kern₀ runs on SMs, the copy engine can be
+  doing H2D₁ for the next batch — so SMs and DMA are both busy
+- But two cooperative kernels never overlap on SMs (they serialize)
+- The stream-ordered allocator avoids cudaMalloc global barriers
+
+- Once your kernel saturates HBM bandwidth, adding more SM tricks barely helps
+- Real bottlenecks in production: DRAM bandwidth and NCCL all-reduce (multi-GPU comms)
+- Warp spec + clusters on top of streams = marginal gain for massive engineering cost
+- Double-buffered kernels + streams already capture most of the performance
+- Rule: optimize the bottleneck, not the already-fast part
+
+Multi-GPU Compute and Data Transfer Overlap with CUDA Streams: 
+
+- Multi-GPU pipeline model parallelism: GPU A runs layers 0-3, GPU B runs layers 4-7
+- Streams + events coordinate the handoff:
+  - stream0_A: compute layers 0-3 on batch N, then immediately start batch N+1
+  - stream1_A: wait for compute (via event), then copy activations to GPU B
+  - stream1_B: wait for copy arrival (via event), then compute layers 4-7
+- Three-way overlap: GPU A compute (N+1) + P2P copy (N) + GPU B compute (N)
+- NCCL handles multi-GPU gradient sync on dedicated high-priority streams -- basically, spawns its own streams for comms
+- Frameworks like PyTorch give communication streams higher priority so
+  they are not blocked behind large compute kernels
+
+
+  Together:
+  ┌─────────┐     DMA engine      NVLink bus       DMA engine     ┌─────────┐
+  │ GPU A   │──→ [copy engine A] ═══════════════→ [copy engine B] │ GPU B   │
+  │ HBM     │    initiates       physical wire     receives       │ HBM     │
+  └─────────┘    the transfer    carries bytes     the data       └─────────┘
+
+- NIXL = NVIDIA's unified transfer API — replaces manual cudaMemcpyPeerAsync
+  - Auto-selects fastest transport (NVLink, RDMA, storage) and pipelines chunks
+  - Called via nixlCommStream, works like NCCL but for point-to-point and disaggregated transfers
+
+- High-priority streams for transfers (both NCCL and NIXL):
+  - Does NOT consume SMs upfront — just gets earlier scheduling in the command queue
+  - Copy engine commands jump ahead of lower-priority work
+  - Uses only idle memory-fabric bandwidth — no contention with compute
+
+- P2P copies vs collectives — different hardware usage:
+  - cudaMemcpyPeerAsync: runs entirely on copy engines, zero SM cost
+  - All-reduce (NCCL): runs as device kernels on a SMALL number of SMs + drives interconnect
+
+- Stream-ordered allocator on multi-GPU:
+  - cudaMallocAsync/cudaFreeAsync in each GPU's compute stream
+  - No device-wide sync → does not stall P2P, NCCL, or NIXL streams on other GPUs
+  - Same allocator from earlier, just applied per-GPU in distributed setting
+
+- Full multi-GPU overlap picture:
+  - Stream A: SM compute (forward/backward)
+  - Stream B: P2P or NCCL transfers (copy engine + few SMs for collectives)
+  - Stream C: async alloc/free + event waits
+  - All three run concurrently without blocking each other
+
+- CUDA Graphs: capture an entire iteration into a replayable DAG
+ - cudaStreamBeginCapture → enqueue all ops → cudaStreamEndCapture → graph
+ - cudaGraphLaunch() replays the whole thing with near-zero CPU overhead
+ - Captures: kernel launches, NCCL, P2P copies, alloc/free, events — everything
+ - Use cudaStreamCaptureModeGlobal to capture across multiple streams in same thread
+ - Supports conditional nodes (e.g., gradient clipping) for infrequent branches
+ - Covered in detail next chapter — this is just the streams relationship
+
+- PyTorch uses this under the hood:
+ - DistributedDataParallel auto-schedules compute, comms, transfers in separate streams
+ - CUDA Graphs available but must be explicitly enabled (not automatic)
+

@@ -840,3 +840,122 @@ Multi-GPU Compute and Data Transfer Overlap with CUDA Streams:
  - DistributedDataParallel auto-schedules compute, comms, transfers in separate streams
  - CUDA Graphs available but must be explicitly enabled (not automatic)
 
+2/20/26:
+
+Programmatic Dependent Launch:
+
+- Programmatic Dependent Launch (PDL): kernel-to-kernel handoff on the GPU, no CPU round-trip
+  - Kernel A signals "my data is ready" via cudaTriggerProgrammaticLaunchCompletion()
+  - Kernel B waits for that signal via cudaGridDependencySynchronize()
+  - Both kernels are in the SAME stream — normally same-stream = fully serial
+  - PDL allows partial overlap: kernel B starts while kernel A's epilogue still runs
+
+- Three techniques combined: PDL (inter-kernel) + warp spec (intra-kernel) + clusters (inter-block)
+
+ WHAT EACH DOES IN THIS COMBO
+ ─────────────────────────────────────────────────────────
+ Warp spec:   producer warp loads tiles via async copy, consumer warps compute
+              → hides HBM latency WITHIN a kernel
+ Clusters:    2 CTAs grouped on adjacent SMs, share tiles via DSMEM/TMA multicast
+              → eliminates duplicate loads, enables load balancing
+ PDL:         primary_gemm triggers secondary_gemm before fully exiting
+              → hides kernel launch gap, secondary starts during primary's epilogue
+
+ TIMELINE
+ ─────────────────────────────────────────────────────────
+ Without PDL:
+ [==primary_gemm==][gap][==secondary_gemm==]
+
+ With PDL:
+ [==primary_gemm (main)==|==epilogue==]
+                         [==secondary_gemm==]
+                         ↑ overlap — no gap
+
+ Inside each kernel (warp spec + cluster):
+ ┌──── Cluster (2 CTAs on adjacent SMs) ─────┐
+ │ CTA 0 (leader)         CTA 1 (follower)   │
+ │  W0: load A,B → SMEM    W0: idle           │
+ │      TMA multicast ──→  reads via DSMEM    │
+ │  W1+: compute (FMA)     W1+: compute (FMA) │
+ │       cluster.sync() ── cluster.sync()     │
+ └────────────────────────────────────────────┘
+
+ CODE FLOW
+ ─────────────────────────────────────────────────────────
+ Host:
+ 1. Launch primary_gemm normally (<<<grid, block, 0, stream>>>)
+ 2. Configure PDL attribute for secondary_gemm
+ 3. Launch secondary_gemm via cudaLaunchKernelExC — enqueued early
+
+ primary_gemm (device):
+ 1. Producer warp: async copy A,B tiles into SMEM (TMA multicast to cluster)
+ 2. cta.sync() + consumer_wait → all warps see loaded tiles
+ 3. Consumer warps: do_compute() (FMA on tiles)
+ 4. cluster.sync() → all CTAs in cluster done
+ 5. cudaTriggerProgrammaticLaunchCompletion() → "secondary can start"
+ 6. Epilogue work (overlaps with secondary starting up)
+
+ secondary_gemm (device):
+ 1. cudaGridDependencySynchronize() → waits for primary's trigger
+ 2. Same warp-specialized pipeline on next layer's data
+
+
+ DESCRIPTOR-BASED TMA — WHAT IT IS
+ ─────────────────────────────────────────────────────────
+ Normal async copy:
+ - You provide: source pointer + destination pointer + byte count
+ - It is a flat 1D memcpy — you compute offsets manually
+ - cuda::memcpy_async(dst, src, size, pipe)
+
+ Descriptor-based TMA:
+ - You create a DESCRIPTOR on the host that describes the tensor layout:
+   - base address, dimensions, strides, element type, tile shape
+ - You pass the descriptor + tile coordinates to the hardware
+ - The TMA engine figures out addressing itself
+ - cp.async.bulk.tensor.2d [smem], [desc, {x, y}]
+                                     ↑ just tile coordinates, not byte offsets
+
+ Why it is better:
+ ┌─────────────────────────────────────────────────────────────┐
+ │ Manual addressing:                                          │
+ │   offset = (tile_row * K + tile_col) * sizeof(float)        │
+ │   → burns registers to compute offsets                      │
+ │   → each thread calculates its own address                  │
+ │                                                             │
+ │ Descriptor-based:                                           │
+ │   "load tile at (row=3, col=5) from this tensor descriptor" │
+ │   → TMA hardware computes the address                       │
+ │   → zero register pressure for addressing                   │
+ │   → supports 2D/3D/4D/5D tile shapes natively               │
+ │   → supports multicast to cluster in one instruction        │
+ └─────────────────────────────────────────────────────────────┘
+
+ Descriptor-based TMA reduce (Blackwell-specific):
+ - cp.reduce.async.bulk.tensor — does a REDUCTION during the copy
+ - Example: accumulate partial sums into SMEM while loading
+ - Fuses reduction + data movement into one hardware operation
+ - No extra kernel pass, no extra registers for the reduce logic
+ - Useful for: gradient accumulation, running sums, normalization partials
+
+  LEVEL 1: WARP SPECIALIZATION (within a kernel)
+  ─────────────────────────────────────────────────────────
+  Producer warp: TMA copies tile N+1 from HBM → SMEM     ← copy engine / async hardware
+  Consumer warp: computing on tile N already in SMEM       ← tensor cores / ALUs
+  Both happen at the same time — different hardware units
+
+  LEVEL 2: TMA REDUCE (within a single copy, Blackwell only)
+  ─────────────────────────────────────────────────────────
+  cp.reduce.async.bulk.tensor:
+    As bytes arrive from HBM into SMEM, the TMA engine ALSO
+    applies a reduction (add, min, max) to the destination
+
+    Without reduce:  copy tile → then kernel reduces → two steps
+    With reduce:     copy + reduce in ONE hardware operation → fused
+
+  So on Blackwell you can have THREE things at once:
+  ─────────────────────────────────────────────────────────
+  TMA engine:     loading tile N+2 from HBM, applying reduction as it lands
+  Consumer warps: computing MMA on tile N in SMEM (tensor cores)
+  Storer warps:   writing tile N-1 results back to HBM
+
+  Three different hardware units, three different tiles, all concurrent

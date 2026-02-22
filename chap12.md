@@ -285,3 +285,52 @@ YOUR INSIGHTS (confirmed correct)
     real dynamic scheduling implementation here"
     (and graphs are the opposite — they want everything STATIC
     and predictable, which is why dynamic ops go in eager mode)
+
+CUDA GRAPHS: Core Concept
+═══════════════════════════════════════════════════════════
+
+WITHOUT CUDA Graph:                    WITH CUDA Graph:
+  CPU          GPU                      CPU          GPU
+   │                                     │
+   ├─launch A──→ [A]                     ├─capture──→ record A,B,C
+   ├─launch B──→    [B]                  │            (one-time setup)
+   ├─launch C──→       [C]              │
+   │                                     ├─replay───→ [A][B][C]
+   3 CPU→GPU round trips                 ├─replay───→ [A][B][C]
+   per iteration                         ├─replay───→ [A][B][C]
+                                         1 CPU call per iteration!
+
+- CUDA Graph = record a sequence of GPU ops once, replay with ONE launch call — eliminates per-kernel CPU→GPU launch overhead
+- Capture: BeginCapture → enqueue kernels/copies/events → EndCapture → Instantiate → Replay in loop
+- Only works for REPETITIVE sequences (same ops, same shapes, same pointers each iteration)
+- cudaGraphExecUpdate: tweak node parameters (pointers, sizes) without recapturing entire graph
+- Partial capture OK: only the repetitive portion needs to be graphed
+- PyTorch: torch.cuda.CUDAGraph() + with torch.cuda.graph(g): block to capture, g.replay() to launch
+- Gotcha: must use static buffers (fixed memory addresses) — no allocations inside capture
+- Gotcha: warm-up pass required before capture to initialize lazy CUDA/cuBLAS/cuDNN setup
+- Mnemonic: "Record once, replay forever — CUDA Graph removes the CPU middleman."
+
+- CUDA Graphs: 300 kernel launches → 100 graph replays, ~25% faster end-to-end by eliminating CPU→GPU handshakes
+- Zero GPU idle time between kernels (back-to-back execution) vs ~3µs gaps without graphs
+- Pitfall: graph is invalid if workload size changes — must recapture or use cudaGraphExecUpdate
+- Pitfall: no memory allocation or host-device sync inside capture — allocate everything before capture
+- Pointer stability: all tensors must stay at same memory address across replays — no reallocation between iterations
+- PyTorch: torch.cuda.graph_pool_handle() creates dedicated memory pool for fixed-address tensors during capture
+- Update inputs by copying into static tensors (static_x.copy_(new_data)), never reallocate
+
+Data updating between replays??
+
+SETUP (once):
+  static_input  = torch.empty(shape, device='cuda')  ← fixed address
+  static_output = torch.empty(shape, device='cuda')  ← fixed address
+
+CAPTURE (once):
+  with torch.cuda.graph(g):
+      # Graph records: "read from static_input's ADDRESS, write to static_output's ADDRESS"
+      static_output = model(static_input)
+
+REPLAY LOOP (every iteration):
+  for batch in dataloader:
+      static_input.copy_(batch)    ← Copy NEW data into the SAME address
+      g.replay()                   ← Graph runs on whatever is at that address now
+      result = static_output       ← Read result from fixed address

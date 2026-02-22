@@ -317,6 +317,8 @@ WITHOUT CUDA Graph:                    WITH CUDA Graph:
 - Pointer stability: all tensors must stay at same memory address across replays — no reallocation between iterations
 - PyTorch: torch.cuda.graph_pool_handle() creates dedicated memory pool for fixed-address tensors during capture
 - Update inputs by copying into static tensors (static_x.copy_(new_data)), never reallocate
+- No host-side ops inside capture: print(), RNG, nested captures, memory allocation — graph must be pure deterministic GPU work
+- All tensors pre-allocated with fixed addresses + fixed shapes before capture — no resizing or cudaMalloc during capture
 
 Data updating between replays??
 
@@ -334,3 +336,31 @@ REPLAY LOOP (every iteration):
       static_input.copy_(batch)    ← Copy NEW data into the SAME address
       g.replay()                   ← Graph runs on whatever is at that address now
       result = static_output       ← Read result from fixed address
+
+Dynamic Graph Update: 
+
+- Dynamic update = change kernel parameters, grid/block dims, or pointers in an existing graph without recapturing (~few µs)
+- Workflow: capture template graph at MAX expected size → update parameters per iteration for actual size
+- Can change: scalar values, pointers, grid dims, swap kernel of same signature
+- Cannot change: graph structure (add/remove nodes) → must recapture if topology changes
+- Best for: semi-static workloads (same pipeline, few varying parameters like batch size)
+- Mnemonic: "Capture the skeleton once, update the muscles each iteration."
+
+Device-Initiated CUDA Graph Launch:
+- GPU can launch graphs automatically
+- Device-initiated launch = GPU kernel triggers a prerecorded graph entirely on-device, no CPU round-trip
+- Setup: capture graph on host → cudaGraphInstantiate with DeviceLaunch flag → cudaGraphUpload to GPU memory (must upload before device launch)
+- ~2× lower launch latency vs host-side graph launch, and latency stays flat regardless of graph size/width
+- Host-launch latency grows with more nodes/branches (CPU scheduling overhead); device-launch does not
+- Launch API from device code: cudaGraphLaunch(graphExec, stream) with special stream values for mode selection
+- Fire-and-forget (cudaStreamGraphFireAndForget): child graph runs immediately, concurrently with parent kernel (max 120 per graph execution)
+- Tail launch (cudaStreamGraphTailLaunch): child runs after parent finishes
+- Sibling launch (cudaStreamGraphFireAndForgetAsSibling): concurrent like fire-and-forget but scheduled as sibling
+- Debug with Nsight Systems (child graphs appear as separate GPU timeline streams) + NVTX markers around cudaGraphLaunch calls
+
+- Self-relaunch pattern: scheduler kernel calls cudaGetCurrentGraphExec() to get its own graph handle, then tail-launches itself
+- This creates an infinite GPU-resident loop: schedule → work → schedule → work... with zero CPU involvement
+- Only 1 pending self-tail-launch allowed at a time (prevents unbounded self-queuing / stack overflow on GPU)
+- Tail launches from the SAME graph execute in enqueue order (FIFO) — so worker runs before self-relaunch
+- Tail launches from NESTED graphs (child enqueuing more tails) run BEFORE the parent's remaining tails (LIFO/stack insertion)
+- Max 255 pending tail launches total per graph

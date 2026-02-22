@@ -412,3 +412,26 @@ Conditional Graph Nodes:
 - Set condition from a single thread to avoid races; ensure memory is flushed before conditional node reads it
 - Conditional nodes can nest (e.g., WHILE body contains IF) for multilevel logic — all on GPU
 - PyTorch has no Python API for conditional nodes yet — requires custom C++ integration
+
+Dynamic Parallelism: Launch child kernels from the parent kernel based on the evalution of the parent kernel without using CPU resources -- consumes more GPU resources though. 
+
+- Dynamic Parallelism (DP) = parent kernel spawns child kernels on GPU at runtime — no prerecorded graph needed
+- Use case: irregular/data-dependent workloads where execution shape isn't known ahead of time (adaptive mesh, graph traversal, recursive problems)
+- Diagnostic signal: profiler shows Kernel A → GPU idle gap → Kernel B (idle = CPU deciding next launch)
+- Parent kernel doesn't complete until all its children complete (implicit sync, no cudaDeviceSynchronize needed)
+- Launch from single thread (threadIdx.x==0 && blockIdx.x==0) to avoid duplicate child launches
+- Compile with -rdc=true (relocatable device code)
+- Costs: per-launch overhead (~25µs vs ~20µs host-side), extra stack space, max 2048 pending child launches (configurable via cudaLimitDevRuntimePendingLaunchCount)
+- Bump stack if needed: cudaDeviceSetLimit(cudaLimitStackSize, newSize)
+- Example result: 3 host launches → 1 host launch, ~40% idle → ~5% idle, ~25% faster overall
+- Bonus: data locality preserved — intermediate results stay on GPU, no cache eviction from CPU round-trips
+- DP is NOT always a win — if child kernel work is too small, device-side launch overhead negates the benefit. Always profile with Nsight Compute.
+
+Decision guide:
+
+CUDA Graphs          → execution shape known ahead of time, repeated many times (amortize capture cost)
+Conditional Nodes    → known structure with runtime branching (IF/WHILE/SWITCH)
+Device-Initiated Graph → known graphs, GPU decides WHICH to launch
+Dynamic Parallelism  → execution shape unknown, emerges from data at runtime
+
+Graphs for plans, DP for surprises

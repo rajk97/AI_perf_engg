@@ -435,3 +435,105 @@ Device-Initiated Graph → known graphs, GPU decides WHICH to launch
 Dynamic Parallelism  → execution shape unknown, emerges from data at runtime
 
 Graphs for plans, DP for surprises
+
+Orchestrate Acrsoss Multiple GPUs and Cluster Nodes(NVSHMEM):
+
+- Node = one physical machine in a cluster (e.g., one DGX with 8 GPUs)
+- Inter-node = across machines over InfiniBand (GPUDirect RDMA)
+- Intra-node = within one machine over NVLink/NVSwitch (GPUDirect P2P)
+- NUMA node is a different concept — refers to CPU socket + local memory affinity within one machine
+
+- Core goal at multi-GPU scale: hide data movement behind compute (overlap is mandatory, not optional)
+- Even NVLink is slower than on-device HBM — so P2P transfers MUST overlap with compute on separate streams
+- P2P point-to-point: cudaMemcpyPeerAsync on a comm stream (copy engines, zero SM cost)
+- Collectives (all-reduce): NCCL on a separate stream — auto-arranges rings/trees to saturate NVLink/NVSwitch
+- Inter-node: CUDA-aware MPI auto-uses GPUDirect RDMA over InfiniBand (no CPU staging)
+- Intra-node: GPUDirect P2P over NVLink or PCIe
+- Pattern: stream 1 = compute, stream 2 = communication — both run concurrently
+
+Fine-Grained GPU-to-GPU Memory Sharing with NVSHMEM: 
+
+- NVSHMEM = GPU-level shared memory library using PGAS (Partitioned Global Address Space) — each GPU is a "PE" (processing element)
+- Key capability: GPU kernel directly reads/writes another GPU's memory from device code, no CPU involved
+- Pattern: put data → nvshmem_quiet() (ensure completion) → set flag on remote GPU; receiver spins on flag then reads data
+- All communication is one-sided RMA (Remote Memory Access) — single hardware transaction over NVLink/PCIe
+- vs cudaMemcpyPeerAsync: that's CPU-initiated (host tells copy engine); NVSHMEM is GPU-initiated (kernel code does the write)
+- Achieves near-peak wire speed by bypassing CPU + kernel launch overhead
+- Danger: it's GPU-level shared-memory programming — you own synchronization and race prevention
+- Prefer fine-grained signals (nvshmem_wait_until, nvshmem_signal_*) over global barriers (nvshmem_barrier_all) to avoid stalling all GPUs on the slowest peer
+
+- NVSHMEM kernels can be captured inside CUDA Graphs (operations are inside kernels, not separate graph nodes)
+- Transformer pipeline example: GPU 0 computes attention → NVSHMEM puts activations to GPU 1 + signals → GPU 1 starts MLP; GPU 0 immediately starts next batch → both GPUs in perfect tandem, near-100% utilization
+- Work-stealing pattern: nvshmem_int_atomic_inc on a global queue counter — each GPU grabs next task dynamically, no host coordination
+- Cooperative launch: nvshmemx_collective_launch() starts same kernel on ALL GPUs simultaneously — required for device-side barriers/collectives
+- nvshmem_barrier_all() inside cooperative kernel = lockstep execution across all GPUs (use sparingly — stalls on slowest GPU)
+
+Capturing Multi-GPU Collectives with NCCL and CUDA Graphs:
+- Without this, there is overhead of host nccl calls everytie -- instead put on a graph and keep replaying. 
+- Capture forward + ncclAllReduce + backward into one CUDA Graph → replay with single cudaGraphLaunch per iteration
+- All ranks MUST capture and replay the same NCCL sequence with the same communicator (mismatch → deadlock or silent corruption)
+- Bucketed all-reduce: split gradients into chunks on streamA, all-reduce each chunk on streamB → compute/comms overlap hides network time
+- PyTorch DDP does bucketed all-reduce automatically; wrapping in CUDA Graph further reduces CPU overhead + gives deterministic timing
+- Practical rules: allocate gradient/comm buffers BEFORE capture; warm up collectives first; use cudaGraphExecUpdate to patch params without recapture
+- At scale (100K+ GPUs), per-step CPU savings compound → tighter sync, higher utilization across cluster
+- NCCL = bulk collectives (all-reduce, broadcast). NVSHMEM = fine-grained, async, point-to-point GPU↔GPU sharing
+
+Pattern for N-GPU Scaling:
+- Scaling pattern is always the same: dispatch once, overlap transfers with compute, keep CPU off critical path
+- Ideal: N GPUs = N× speedup — only if all GPUs stay fed with data and communication is hidden behind compute
+- Without overlap, scaling plateaus when comms time = compute time (Amdahl's law on communication)
+- As GPU count grows: more aggressive pipelining, less CPU orchestration — offload to async copies, NCCL-in-graphs, NVSHMEM
+
+Roofline-Guided Scheduling and Orchestration Decisions:
+- Memory-bound kernel: kernel fusion helps modestly (fewer global mem round-trips); real gains from latency masking + more loads/stores in flight + reduce precision (FP16/FP8/FP4)
+- Compute-bound kernel: fusion shines (combine ops → higher FLOPS/byte → shift right on roofline); reduce launch overhead with persistent kernels, CUDA Graphs, device-side launches to keep ALUs fed
+- Neither bound (middle of roofline): increase concurrency — parallel streams, concurrent graphs, multiple persistent kernels → aggregate throughput climbs on both axes
+- Persistent kernels, graphs, device-initiated launches don't change arithmetic intensity — they reduce idle gaps, pushing actual perf closer to the ceiling
+- Always: Nsight Compute to measure FLOPS + bytes → plot on roofline → pick strategy based on which roof you're under → measure again after each change
+
+ROOFLINE MODEL:
+                          ┌───────────────── compute ceiling (peak FLOPS)
+  Performance             │
+  (FLOPS/s)     ─────────/
+               /         │
+              / ←slope   │
+             /  (memory  │
+            /   ceiling) │
+           /             │
+          /              │
+         /               │
+        ──────────────────────────────→
+                  Arithmetic Intensity (FLOPS/byte)
+
+
+CASE 1: Below the slope
+  ×  ← your kernel (below the line)
+  /
+  You're NOT hitting peak memory bandwidth
+  = memory-INEFFICIENT (bad access patterns, uncoalesced, misaligned)
+  Fix: coalesce, align, SoA, vectorized loads
+
+
+CASE 2: On the slope
+  /
+  × ← your kernel (on the line)
+  You ARE hitting peak memory bandwidth
+  = memory-BOUND (bandwidth wall reached)
+  Can't squeeze more bandwidth, BUT you can:
+    → Shift RIGHT: reduce precision (FP16→FP8), fuse ops, reuse data in registers/smem
+    → This increases FLOPS/byte → moves you toward the flat (compute) ceiling
+
+
+CASE 3: Below the flat ceiling
+         ─────────────
+         × ← your kernel (below the flat part)
+  = compute-INEFFICIENT (low occupancy, idle gaps, launch overhead)
+  Fix: persistent kernels, CUDA Graphs, increase occupancy
+
+
+CASE 4: On the flat ceiling
+         ──────×──────
+  = compute-BOUND (ALUs maxed out)
+  Only fix: better algorithm or faster hardware
+
+Chapter 12 done!

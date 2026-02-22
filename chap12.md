@@ -364,3 +364,51 @@ Device-Initiated CUDA Graph Launch:
 - Tail launches from the SAME graph execute in enqueue order (FIFO) — so worker runs before self-relaunch
 - Tail launches from NESTED graphs (child enqueuing more tails) run BEFORE the parent's remaining tails (LIFO/stack insertion)
 - Max 255 pending tail launches total per graph
+- Sibling launch = fire-and-forget but runs as a peer (not child) of parent graph, in parent's stream environment
+- Key difference from fire-and-forget: sibling doesn't delay parent's tail launches (fire-and-forget child could)
+- API: cudaGraphLaunch(graphExec, cudaStreamGraphFireAndForgetAsSibling)
+- Decision guide: need results from graph → tail launch; side task → fire-and-forget/sibling; independent peer work → sibling
+- Practical pattern: GPU kernel branches on data content and directly launches the appropriate prerecorded graph (e.g., LZ vs Huffman) — no CPU round-trip to decide
+
+FIRE-AND-FORGET          TAIL LAUNCH              SIBLING
+─────────────────────    ─────────────────────    ─────────────────────
+Parent ██████████───→    Parent ██████████        Parent ██████████───→
+       ↓                        ↓                        ↓
+Child  ████████ (concurrent)   (parent done)     Sibling ████████ (concurrent)
+       (is a child)            ↓                        (is a peer)
+                         Graph █████████                 
+                         (runs after parent)     Tail launches NOT blocked
+                                                 by sibling
+
+Atomic Queues and Device-Initiated CUDA Graphs for
+In-Kernel Persistent Scheduling:
+
+    ┌──────────────────────────────────────────────────────┐
+    │  PERSISTENT SCHEDULER KERNEL (loops on GPU)          │
+    │                                                      │
+    │   while (work in queue) {                            │
+    │       ┌──────────────────────────────────────┐       │
+    │       │ idx = atomicAdd(&queueHead, 1)       │       │
+    │       │        (claim next token)            │       │
+    │       └──────────────────┬───────────────────┘       │
+    │                          ▼                           │
+    │       ┌──────────────────────────────────────┐       │
+    │       │ TAIL-LAUNCH: Decode Graph            │       │
+    │       │ (precaptured attention + FFN)        │       │
+    │       └──────────────────┬───────────────────┘       │
+    │                          ▼                           │
+    │       (graph completes → loop back)                  │
+    │   }                                                  │
+    │                                                      │
+    │   CPU: 😴 not involved                               │
+    └──────────────────────────────────────────────────────┘
+
+Conditional Graph Nodes:
+    
+- Conditional graph nodes = embed control flow (IF, IF/ELSE, WHILE, SWITCH) directly into CUDA Graphs, evaluated on GPU
+- Controlled by a "condition handle" — a small integer set on-device via cudaGraphSetConditional(handle, flag)
+- IF: runs body once if flag ≠ 0 | IF/ELSE: two body graphs, picks one | WHILE: loops body while flag ≠ 0 | SWITCH: N body graphs, runs the i-th one
+- Setup: create handle → add upstream kernel that computes & sets handle → add conditional node → populate body subgraph(s)
+- Set condition from a single thread to avoid races; ensure memory is flushed before conditional node reads it
+- Conditional nodes can nest (e.g., WHILE body contains IF) for multilevel logic — all on GPU
+- PyTorch has no Python API for conditional nodes yet — requires custom C++ integration

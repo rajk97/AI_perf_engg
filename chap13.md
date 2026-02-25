@@ -294,3 +294,201 @@ Mode               Compile time    Runtime speed    What it does
 "reduce-overhead"  medium          fast             uses CUDA Graphs
 "max-autotune"     slow            fastest          tries many kernel variants
 
+2/25/26: 
+
+TORCH.COMPILE RESULTS + MODES — SUMMARY
+──────────────────────────────────────────────
+
+WHY MoE BENEFITS MORE THAN DENSE MODELS
+──────────────────────────────────────────────
+MoE: hundreds of small ops (dispatch, combine, per-token activations)
+  --> many kernel launches, much Python overhead
+  --> compiler fuses them --> big win (~30%)
+
+Dense: one massive GEMM dominates (already using Tensor Cores well)
+  --> little to fuse --> small win (<10%)
+
+CUSTOM KERNELS vs COMPILER
+──────────────────────────────────────────────
+Priority order:
+  1. torch.compile first           (free, easy, covers most cases)
+  2. Custom Triton/CUDA kernel     (only for ops compiler can't handle)
+  3. Register custom op in compile (embed hand-tuned kernel in compiled graph)
+
+You can mix both: compiler optimizes surrounding ops,
+custom kernel handles the hot spot — best of both worlds
+
+
+COMPILATION MODES
+──────────────────────────────────────────────
+Mode                       Compile   Speed   CUDA    Best for
+                           time              Graphs
+-----------------------    -------   -----   ------  -------------------------
+default                    low       good    maybe   first try, large models
+reduce-overhead            medium    fast    yes     small batches, inference
+max-autotune               high      best    yes     long training, fixed shapes
+max-autotune-no-cudagraphs high      best    no      dynamic shapes, debugging
+
+Mode                        Description                                                          Compile time    Extra memory              Notable features
+--------------------------  -------------------------------------------------------------------  --------------  ------------------------  ------------------------------------------
+default                     Balanced optimizations (good speed without long compile or extra      Low-Medium      No                        General fusion, basic autotuning
+                            mem); includes minor autotuning; may use CUDA Graphs for stable
+                            segments
+
+reduce-overhead             Reduces per-iteration overhead (good for small batches); ideal for    Medium          Yes (workspace caching)   Uses CUDA Graphs (if possible) to
+                            inference or small batches; automatically skips CUDA Graphs if it                                               eliminate launch overhead
+                            detects dynamic shapes to preserve correctness
+
+max-autotune                Maximizes runtime performance (best for long runs); longer compile    High (slow      Maybe (if graphs are      Aggressive Triton autotuning; enables
+                            time; best for aggressive tuning for a large amount of SMs and GPU    compile)        used)                     CUDA Graphs on GPU
+                            memory
+
+max-autotune-no-cudagraphs  Does everything max-autotune does but without CUDA Graph capture.     High            No                        Same as max-autotune but disables
+                            Best for dynamic shapes or for debugging issues masked by CUDA                                                  graphs for flexibility
+                            Graphs
+
+
+                     compile time --->
+  default -----> reduce-overhead -----> max-autotune
+  least effort                          most tuning
+  good enough                           best runtime
+
+KEY CONSTRAINTS
+──────────────────────────────────────────────
+- CUDA Graphs modes (reduce-overhead, max-autotune):
+  need fixed shapes, fixed memory addresses, no dynamic control flow
+  --> compiler auto-falls-back to eager if it detects dynamic shapes
+
+- Dynamic token routing (MoE):
+  use default or max-autotune-no-cudagraphs first
+  switch to max-autotune once shapes stabilize
+
+- max-autotune can sometimes REGRESS latency — always profile each mode
+
+DECISION FLOW
+──────────────────────────────────────────────
+Start: torch.compile(model)                        (default)
+  |
+  Still slow?
+  |-- small batch / inference --> mode="reduce-overhead"
+  |-- long training job       --> mode="max-autotune"
+  |-- dynamic shapes          --> mode="max-autotune-no-cudagraphs"
+  |
+  Still slow on specific op?
+  |-- write custom Triton/CUDA kernel, register as custom op
+
+REGIONAL COMPILATION
+──────────────────────────────────────────────
+
+Without regional:
+  Block 0: [compile] ← 10s
+  Block 1: [compile] ← 10s    (same code, compiled again)
+  Block 2: [compile] ← 10s    (same code, compiled again)
+  ...
+  Block 95: [compile] ← 10s
+  Total: 96 × 10s = 960s compile time
+
+With regional (torch.compiler.nested_compile_region):
+  Block 0: [compile] ← 10s
+  Block 1: [reuse]   ← ~0s    (same compiled code)
+  Block 2: [reuse]   ← ~0s
+  ...
+  Block 95: [reuse]  ← ~0s
+  Total: 10s compile time
+
+- Same runtime speed, just faster startup
+- Auto-recompiles if shapes/dtype/device change (correctness preserved)
+- Best for: transformers/MoEs with many identical layers, inference, short jobs
+
+DEBUGGING TORCH.COMPILE ISSUES
+──────────────────────────────────────────────
+
+Graph break = compiler gives up on a section, falls back to eager (slow)
+
+DIAGNOSTIC TOOLS
+──────────────────────────────────────────────
+Tool/command                                What it does
+------------------------------------------  ----------------------------------
+torch._dynamo.explain(model)                Lists graph breaks + reasons + suggestions
+TORCH_LOGS="+dynamo,+inductor"              Verbose logs: breaks, fallbacks, compile phases
+torch._dynamo.mark_dynamic(tensor, dim)     Tell compiler to expect variable shape on dim
+TORCHINDUCTOR_UNIQUE_KERNEL_NAMES=1         Name kernels for profiling
+TORCHINDUCTOR_BENCHMARK_KERNEL=1            Auto-generate benchmark harness per kernel
+
+Common graph break causes:
+ - Unsupported ops
+ - Data-dependent control flow (if tensor.item() > 0: ...)
+ - Dynamic shapes without shape guards
+
+Fix options:
+ - Replace unsupported op with supported equivalent
+ - mark_dynamic for known variable dimensions -- mark regions as dynamic ones so that the compiler knows it
+ - Split model: compile static parts, run dynamic parts eagerly
+ - Use max-autotune-no-cudagraphs for truly dynamic workloads
+
+
+PYTORCH ATTENTION MECHANISMS
+──────────────────────────────────────────────
+
+API                  What it does                              When to use
+-------------------  ----------------------------------------  ----------------------------
+SDPA                 Auto-selects fastest attention backend    Default choice, no-hassle
+                    (Flash, memory-efficient, or math)        standard attention patterns
+
+FlexAttention        Compiler-generated kernels for custom     Block-sparse, sliding-window,
+                    sparse attention patterns                 any pattern SDPA can't handle
+
+FlexDecoding         Optimized autoregressive decoding         LLM inference, long generation
+                    + KV cache management, works with         sequences, compile-time
+                    torch.compile                             decode optimization
+
+Context Parallel     Shards attention along sequence length    Scaling to very long contexts
+                    across multiple GPUs/ranks                across multiple devices
+                    (splits QKV by sequence, syncs            (not within-GPU parallelism)
+                    during attention)
+
+TORCHAO — PYTORCH ARCHITECTURE OPTIMIZATION
+──────────────────────────────────────────────
+- Single namespace for quantization, sparsity, and pruning
+
+torchao.quantization:  PTQ, QAT, INT8, FP8 (reduces memory + speeds up compute)
+torchao.pruning:       remove weights (smaller model)
+torchao.sparsity:      2:4 structured sparsity, block sparsity (hardware-accelerated)
+
+- Integrates with torch.compile: TorchInductor emits kernels that use torchao
+- Works for both training and inference
+
+- CUDA streams in PyTorch
+  - By default, all ops go on stream 0 (default stream) → sequential execution
+  - Create non-default streams with `torch.cuda.Stream()` to run independent work concurrently
+  - Use `with torch.cuda.stream(stream):` context manager to enqueue ops on a specific stream
+
+- Overlapping H2D transfer + compute (double-buffering pattern)
+
+  CPU (Python) enqueues everything non-blocking, never waits:
+  ┌────────────────────────────────────────────────────────────────┐
+  │ 1. compute_stream.wait_stream(transfer_stream) → GPU fence    │
+  │ 2. Enqueue batch i+1 H2D copy on transfer_stream              │
+  │ 3. Enqueue fwd/bwd of batch i on compute_stream               │
+  │ 4. Loop back immediately                                      │
+  └────────────────────────────────────────────────────────────────┘
+
+  GPU executes on separate hardware units concurrently:
+                     time ────────────────────────────────────►
+  transfer_stream:  [H2D batch i+1 (copy engine)] [H2D batch i+2]
+  compute_stream:   [fwd/bwd batch i (SMs)]        [fwd/bwd batch i+1]
+
+- Key mechanisms
+  - `compute_stream.wait_stream(transfer_stream)` = GPU-side-only fence
+    - Compute stream waits for transfer to finish before using that batch
+    - Transfer stream is NOT blocked — keeps copying next batch
+    - CPU/Python thread is NOT blocked — just inserts a marker and moves on
+  - `.to(device, non_blocking=True)` = async DMA copy, doesn't block CPU thread
+  - `next(dataloader_iter, None)` = explicit control over when transfers are enqueued
+  - One batch always in-flight per stream → decouples loading from compute
+
+- Profiling tip
+  - Use Nsight Systems or PyTorch profiler to verify overlap
+  - Look for: transfer and compute lanes running in parallel → near 100% GPU utilization
+  - Watch for: implicit syncs like `print()` on CUDA tensors or extra `synchronize()` calls that serialize everything
+  

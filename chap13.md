@@ -491,4 +491,81 @@ torchao.sparsity:      2:4 structured sparsity, block sparsity (hardware-acceler
   - Use Nsight Systems or PyTorch profiler to verify overlap
   - Look for: transfer and compute lanes running in parallel → near 100% GPU utilization
   - Watch for: implicit syncs like `print()` on CUDA tensors or extra `synchronize()` calls that serialize everything
+
+2/26/26: 
+  - CUDA Graphs in PyTorch = capture once, replay many times → eliminates per-iteration CPU launch overhead
+
+- Capture pattern
+
+  1. Preallocate static_input, static_output at max required size
+  2. Warm up on a dedicated non-default capture_stream (allocates all internal buffers)
+  3. capture_stream.synchronize()
+  4. Capture: torch.cuda.graph(g, stream=capture_stream) — records ops, doesn't execute
+  5. capture_stream.synchronize()
+
+  ┌─────────────────────────────────────────────────────────┐
+  │ Preallocate → Warm-up → sync → Capture → sync → Replay │
+  └─────────────────────────────────────────────────────────┘
+
+- Replay pattern
+  static_input.copy_(new_batch)   ← load new data into same memory
+  g.replay()                      ← GPU runs captured op sequence
+  result = static_output.clone()  ← clone if you need to keep it (graph overwrites each replay)
+
+- Critical constraints
+  - NO new memory allocations during capture — all buffers must exist from warm-up
+  - Strict isolation: no CUDA ops on other streams during capture, or you get "operation not permitted"
+  - Changing model weights outside the graph won't take effect — must recapture
+  - Static shapes only (use max-autotune-no-cudagraphs for dynamic shapes)
+  - torch.cuda.empty_cache() before capture = one-time defrag, NOT a regular tool
+
+- Synchronization
+  - g.replay() is async — must sync before reading static_output
+  - Don't print() or .item() on GPU tensor mid-pipeline → use .cpu().numpy() after sync, outside async regions
+
+- Memory pools
+  - Each graph instance gets its own private memory pool by default → no contention between concurrent graphs
+  - cudaMallocAsync reuses same addresses on each replay (no new allocations needed)
+  - Optional: torch.cuda.graph(pool=...) to share a pool across graph instances
+
+- Shared pool trick (FireworksAI)
+  - Multiple batch-size-specialized graphs (1, 2, 4, 8) share one pool
+  - Compile in decreasing batch size order → largest variant allocates the pool
+  - Smaller variants reuse the larger allocation → saves GPU memory in serving
+
+- CUDA Graphs best practices
+
+  1. No allocations during capture — preallocate all buffers (including optimizer states!) in warm-up
+  2. Fixed graph structure — no shape/op changes after capture
+     - Multiple shapes? Capture separate graphs per shape, select at runtime
+     - Or use max-autotune-no-cudagraphs mode
+  3. Capture as much as possible — ideally entire training iteration (fwd + bwd + optimizer + allreduce)
+     - MLPerf submissions capture everything into one graph per iteration
+     - Can even capture multiple iterations (loop unrolling) if memory allows
+  4. Plan for max size — capture with worst-case batch size to avoid graph failure
+     - e.g., max batch 64 but sometimes 96 → capture at 96, waste memory instead of breaking
+  5. Stream priorities — in multi-GPU, set NCCL to lower-priority stream so compute kernels run first
+  6. Graphs are immutable in PyTorch — cudaGraphExecUpdate() exists in CUDA but PyTorch doesn't expose it
+
+- CUDA Graph Trees (torch.compile internal)
+  - Used by mode="reduce-overhead" automatically
+  - Per-shape piecewise capture: each unique input shape gets its own cached graph
+  - Fewer distinct shapes → more cache hits → less capture overhead
+  - Multiple subgraphs share a single memory pool (fwd + bwd captures)
+  - Enables dynamic subgraph selection at runtime based on shape/batch size
+
+  Shape A → Graph A (cached) ─┐
+  Shape B → Graph B (cached) ─┼── shared memory pool
+  Shape C → Graph C (cached) ─┘
+              ↑ vLLM uses this for variable batch sizes in inference
+
+- Why full-graph capture is hard for LLM inference
+  - Variable input sizes, batch sizes, KV cache growth, host-side decisions
+  - Piecewise capture (Graph Trees) is the workaround
+
+- Memory profiling intro
+  - torch.profiler with profile_memory=True → shows per-op memory allocations
+  - PyTorch memory visualizer tool → visual timeline of memory usage
+  - Nsight Systems CUDA Memory Inspector → visualizes fragmentation over time
   
+    

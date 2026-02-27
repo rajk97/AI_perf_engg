@@ -567,5 +567,172 @@ torchao.sparsity:      2:4 structured sparsity, block sparsity (hardware-acceler
   - torch.profiler with profile_memory=True → shows per-op memory allocations
   - PyTorch memory visualizer tool → visual timeline of memory usage
   - Nsight Systems CUDA Memory Inspector → visualizes fragmentation over time
-  
-    
+
+- Tuning the CUDA memory allocator
+
+  Problem: variable-sized allocs (e.g., MoE expert outputs) → fragmentation
+  Fix 1: Preallocate fixed max-size buffers, reuse every iteration
+  Fix 2: Tune allocator via PYTORCH_ALLOC_CONF:
+
+  ┌─────────────────────────────────────────────────────────────────┐
+  │ max_split_size_mb:256     → keep free blocks ≤256MB intact     │
+  │                             (don't split into tiny pieces)     │
+  │                                                                │
+  │ roundup_power2_divisions  → bucket allocation sizes            │
+  │   [256:1, 512:2, 1024:4] → fewer unique sizes = more reuse    │
+  │                                                                │
+  │ backend:cudaMallocAsync   → async free (no sync on dealloc)    │
+  │                             good for multi-worker data loading │
+  └─────────────────────────────────────────────────────────────────┘
+
+  Monitor: torch.cuda.memory_stats() → fragmentation over time
+           torch.cuda.mem_get_info() → free vs total (indirect fragmentation check)
+
+- Activation checkpointing (gradient checkpointing)
+
+  Problem: storing all intermediate activations for backward pass → OOM on large models
+
+  Without checkpointing:
+    Forward:  [Layer 1] → save act1 → [Layer 2] → save act2 → ... → save actN
+    Memory:   act1 + act2 + ... + actN all in HBM simultaneously → OOM
+
+  With checkpointing:
+    Forward:  [Layer 1] → discard act1 → [Layer 2] → discard act2 → ... → output
+    Backward: need act3? → rerun Layer 3 forward → compute grad → discard again
+    Memory:   only 1 layer's activations at a time → fits in HBM
+
+  Tradeoff:
+    ┌──────────────────┬──────────────────────────────────┐
+    │ Save memory       │ Costs extra compute (recompute)  │
+    │ Larger batch size │ ~30% more FLOPs per iteration    │
+    │ Larger models fit │ Modern GPUs have FLOPS to spare  │
+    └──────────────────┴──────────────────────────────────┘
+
+  Strategy: checkpoint only the big layers (transformer blocks), skip small ones (layernorm, embedding)
+  In FSDP: automated recursive checkpointing available
+
+- Offloading parameters to CPU / NVMe
+
+  When model still doesn't fit after checkpointing → offload inactive params
+
+  ┌────────────────────────────────────────────────────────────────┐
+  │              GPU HBM (fast, limited)                          │
+  │   [Active layer weights] [Current activations]               │
+  │         ↑ prefetch next layer                                │
+  │         │ async DMA (.to(device, non_blocking=True))         │
+  │─────────┼────────────────────────────────────────────────────│
+  │         │    CPU DRAM (slower, larger)                        │
+  │   [Inactive expert weights] [Optimizer states]               │
+  │         ↑ swap from NVMe if needed                           │
+  │─────────┼────────────────────────────────────────────────────│
+  │         │    NVMe/SSD (slowest, largest) — last resort       │
+  │   [Rarely used params] [Overflow]                            │
+  └────────────────────────────────────────────────────────────────┘
+
+  Key: overlap transfer with compute so GPU never stalls:
+    GPU:  [compute layer i]──────[compute layer i+1]──────
+    DMA:     [prefetch layer i+1]───[prefetch layer i+2]───
+
+  Frameworks: DeepSpeed ZeRO-Infinity (train), ZeRO-Inference (serve) — automate this
+  Hardware options:
+    - Pin host memory + cudaMemcpyAsync → explicit, predictable
+    - Unified Memory (Grace Blackwell NVLink-C2C) → automatic page migration, but unpredictable
+    - GPUDirect Storage → GPU reads NVMe directly, no CPU involvement
+
+- SuperOffload (superchip-optimized offloading)
+  - Designed for CPU-GPU superchips (Grace Hopper, Grace Blackwell, Vera Rubin)
+  - Exploits NVLink-C2C high-bandwidth coherent interconnect between CPU and GPU
+
+  Key innovations:
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │ 1. STV (Speculation-Then-Validation)                                │
+  │    CPU starts optimizer update DURING backward (speculative)        │
+  │    Validates after allreduce finishes → removes optimizer from      │
+  │    critical path                                                    │
+  │                                                                     │
+  │ 2. Heterogeneous optimizer split                                    │
+  │    GPU: heavy tensor updates (weight = weight - lr × m/√v)         │
+  │    CPU: light state updates (momentum buffers, variance tracking)   │
+  │    → both devices busy, no idle cycles                              │
+  │                                                                     │
+  │ 3. Superchip-aware type casts + copies                              │
+  │    Shift FP32↔BF16 conversions toward GPU (faster at math)          │
+  │    NVLink-C2C makes CPU↔GPU transfer cheap → changes placement      │
+  │    strategy for what goes where                                     │
+  │                                                                     │
+  │ 4. GraceAdam                                                        │
+  │    CPU-optimized Adam using ARM SVE (Scalable Vector Extension)     │
+  │    32 vector registers + 16 predicate registers → fast vectorized   │
+  │    optimizer on Grace ARM cores                                     │
+  └──────────────────────────────────────────────────────────────────────┘
+
+- FSDP (Fully Sharded Data Parallel) = ZeRO Stage-3 in PyTorch
+  - Shards parameters + gradients + optimizer states across GPUs
+
+  Without FSDP (DDP):
+    GPU 0: [full model + full optimizer states]  ← duplicated on every GPU
+    GPU 1: [full model + full optimizer states]
+
+  With FSDP:
+    GPU 0: [shard 0 of params/grads/optimizer]  ← each GPU holds 1/N
+    GPU 1: [shard 1 of params/grads/optimizer]
+    → allgather before fwd/bwd, reduce-scatter after → each GPU only stores its shard
+
+  Built-in automation (no boilerplate needed):
+  ┌──────────────────────────────────────────────────────────────┐
+  │ auto_wrap_policy       → auto-shard by transformer block     │
+  │ CPUOffload             → move params/grads to CPU when idle  │
+  │ activation_checkpointing_policy → recompute activations for  │
+  │                          specified layers (TransformerBlock)  │
+  │ mixed_precision        → BF16 for params/reduce/buffers      │
+  │ backward_prefetch      → BACKWARD_PRE = prefetch next shard  │
+  │                          during backward (overlap comm+comp) │
+  │ use_orig_params=True   → no flattening, better overlap       │
+  └──────────────────────────────────────────────────────────────┘
+- Why sharding exists
+  - Model state (params + grads + optimizer) >> single GPU memory
+  - 70B model + Adam = ~1,120 GB total; H100 = 80 GB → must split across GPUs
+
+- FSDP sharding strategies
+
+  ┌─────────────────┬───────────────┬──────────────────┬─────────────────────────┐
+  │ Strategy         │ ZeRO Stage    │ What's sharded   │ When to use             │
+  ├─────────────────┼───────────────┼──────────────────┼─────────────────────────┤
+  │ SHARD_GRAD_OP    │ Stage 2       │ Grads + optimizer │ Few GPUs / slow network │
+  │                  │               │ (params = full    │ Least comms, most       │
+  │                  │               │  copy everywhere) │ memory per GPU          │
+  ├─────────────────┼───────────────┼──────────────────┼─────────────────────────┤
+  │ FULL_SHARD       │ Stage 3       │ Params + grads +  │ Fast fabric (NVLink     │
+  │                  │               │ optimizer — ALL   │ across nodes), want     │
+  │                  │               │ across ALL GPUs   │ smallest memory/GPU     │
+  ├─────────────────┼───────────────┼──────────────────┼─────────────────────────┤
+  │ HYBRID_SHARD     │ 3 within node │ Shard within node │ Fast intra-node (NVLink)│
+  │                  │ replicate     │ Replicate across  │ Slower inter-node (IB)  │
+  │                  │ across nodes  │ nodes             │ Trade memory for comms  │
+  └─────────────────┴───────────────┴──────────────────┴─────────────────────────┘
+
+- HYBRID_SHARD = spend memory to save comms
+
+  FULL_SHARD (16 GPUs across 2 nodes):
+    GPU 0 needs shard 12 → fetch from Node 1 over slow InfiniBand → bottleneck
+
+  HYBRID_SHARD (same 16 GPUs):
+    Each node holds full model sharded across its 8 local GPUs (replicated)
+    GPU 0 needs any shard → fetch from same node over fast NVLink → no cross-node allgather
+    Cross-node traffic = only gradient reduce (smaller, less frequent)
+
+    ┌─── Node 0 (NVLink 900 GB/s) ───┐     ┌─── Node 1 (NVLink 900 GB/s) ───┐
+    │ GPU0[s0] GPU1[s1] ... GPU7[s7]  │     │ GPU0[s0] GPU1[s1] ... GPU7[s7]  │
+    │      allgather stays HERE        │     │      allgather stays HERE        │
+    └──────────────┬───────────────────┘     └──────────────┬───────────────────┘
+                   └───── only grad reduce crosses here (InfiniBand 400 GB/s) ──┘
+
+  Cost: each node stores full model (more memory)
+  Gain: allgather never crosses slow inter-node fabric
+
+- FSDP built-in automation (from previous section)
+  - activation_checkpointing_policy → recompute activations for specified transformer layers
+  - CPUOffload → move params/grads to CPU when idle
+  - backward_prefetch=BACKWARD_PRE → prefetch next shard during backward
+  - mixed_precision → BF16 for params/reduce/buffers
+  - Handles uneven per-GPU batch sizes (useful for MoE)

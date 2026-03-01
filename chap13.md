@@ -736,3 +736,60 @@ torchao.sparsity:      2:4 structured sparsity, block sparsity (hardware-acceler
   - backward_prefetch=BACKWARD_PRE → prefetch next shard during backward
   - mixed_precision → BF16 for params/reduce/buffers
   - Handles uneven per-GPU batch sizes (useful for MoE)
+
+2/28/26:
+
+DEFAULT:
+  NCCL asks PyTorch's general allocator for buffers
+  → gets regular GPU memory
+  → works, but hardware (copy engines, NIC, switch) may need extra steps to access it
+
+CUSTOM ALLOCATOR:
+  NCCL gets buffers from its OWN allocator (ncclMemAlloc)
+  → memory is pre-registered, page-aligned, hardware-accessible
+  → copy engines, NIC (RDMA), SHARP switch can grab data directly
+  → = zero-copy
+
+- Blackwell NVLink 5: 1.8 TB/s bidirectional (~900 GB/s each direction) — custom allocators help approach this peak
+- CUDAPluggableAllocator: load any custom .so with alloc/free symbols → use as a CUDA allocator in PyTorch
+- MemPool wraps the allocator with caching (avoids repeated alloc/free overhead)
+- torch.cuda.use_mem_pool(pool): context manager swaps allocator for all allocations inside the block; restores default on exit
+- You can mix allocators in one app: default cudaMalloc for compute tensors, NCCL allocator for comm buffers
+- Debugging: torch.cuda.memory._record_memory_history() + _dump_snapshot() → visualize in PyTorch memory viewer
+
+DMA (Direct Memory Access) = GENERAL CONCEPT
+═══════════════════════════════════════════════
+  A dedicated hardware engine moves data — CPU and SMs not involved
+  This is NOT a specific technology, it's a category
+
+
+GPUDirect P2P = DMA WITHIN a node (same machine)
+═══════════════════════════════════════════════════
+
+  ┌─────────┐     NVLink / PCIe      ┌─────────┐
+  │ GPU A   │ ══════════════════════► │ GPU B   │
+  │ HBM     │   copy engine (DMA)    │ HBM     │
+  └─────────┘   does the transfer    └─────────┘
+
+  Copy engine = the DMA hardware on the GPU
+  Path: GPU memory → wire → GPU memory
+  No CPU RAM, no SMs
+
+
+GPUDirect RDMA = DMA ACROSS nodes (different machines)
+═══════════════════════════════════════════════════════
+
+  Node 0                                          Node 1
+  ┌─────────┐    ┌─────┐   InfiniBand   ┌─────┐  ┌─────────┐
+  │ GPU A   │══► │ NIC │ ════════════► │ NIC │══►│ GPU B   │
+  │ HBM     │    └─────┘               └─────┘   │ HBM     │
+  └─────────┘                                     └─────────┘
+
+  NIC reads GPU memory DIRECTLY (no CPU RAM staging)
+  Path: GPU memory → NIC → network wire → NIC → GPU memory
+  "RDMA" = Remote DMA — the DMA happens across a network
+
+  WITHOUT GPUDirect RDMA (old way):
+  GPU A → CPU RAM → NIC → wire → NIC → CPU RAM → GPU B
+  ^^^^    ^^^^^^^^                      ^^^^^^^^   ^^^^
+  2 extra hops through CPU memory on each side

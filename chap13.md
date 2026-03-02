@@ -793,3 +793,42 @@ GPUDirect RDMA = DMA ACROSS nodes (different machines)
   GPU A → CPU RAM → NIC → wire → NIC → CPU RAM → GPU B
   ^^^^    ^^^^^^^^                      ^^^^^^^^   ^^^^
   2 extra hops through CPU memory on each side
+
+3/2/26
+
+- Peer-to-peer (P2P) DMA = direct GPU-to-GPU transfer, no CPU involved
+  - PyTorch auto-enables when moving tensors across devices
+  - Verify: torch.cuda.can_device_access_peer(i, j)
+  - Uses cudaMemcpyPeerAsync under the hood
+  - Works over NVLink/NVSwitch within a node or rack (e.g., NVL72)
+
+- When P2P DMA works (same node/rack, NVLink connected):
+  GPU 0 ──NVLink──► GPU 1    (direct, no CPU, no network)
+  dst.copy_(src, non_blocking=True)  → uses P2P path automatically
+
+- When P2P DMA doesn't work (cross-node, cross-rack):
+  GPU on Node 0 ──?──► GPU on Node 1
+  No NVLink between nodes → must go through network fabric
+  → NCCL handles this, but by default uses basic transport
+
+- UCX = NCCL plugin for cross-node/cross-rack GPU communication
+  - Replaces NCCL's default network transport with UCX
+  - Enables: RDMA hardware offload, better pipelining, topology-aware routing
+  - Essential when scaling beyond one NVLink domain (multi-rack, multi-node)
+
+  ┌──── NVL72 Rack 0  ────┐         ┌──── NVL72 Rack 1  ────┐
+  │ GPU↔GPU via NVLink    │         │ GPU↔GPU via NVLink    │
+  │ (P2P DMA, fast)       │         │ (P2P DMA, fast)       │
+  └──────────┬────────────┘         └────────── ┬───────────┘
+             │                                  │
+             └──── InfiniBand + NCCL-UCX ───────┘
+                  (RDMA, hardware offload)
+
+  Config:
+    NCCL_NET=UCX
+    NCCL_PLUGIN_P2P=ucx
+    UCX_TLS=rc,self,gdr_copy,cuda_copy
+
+- Summary:
+  Within NVLink domain → P2P DMA (direct, fastest)
+  Across nodes/racks   → NCCL + UCX plugin (RDMA, hardware offload, topology-aware)

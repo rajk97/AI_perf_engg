@@ -832,3 +832,469 @@ GPUDirect RDMA = DMA ACROSS nodes (different machines)
 - Summary:
   Within NVLink domain → P2P DMA (direct, fastest)
   Across nodes/racks   → NCCL + UCX plugin (RDMA, hardware offload, topology-aware)
+
+3/3/26:
+
+- Symmetric memory = shared address space across GPUs
+- Each GPU can directly read/write other GPUs' buffers (one-sided put/get)
+- No CPU handshake, no explicit copy calls, no NCCL setup per op
+- Use case: small, frequent, latency-sensitive cross-GPU ops (MoE token shuffles)
+- CUDA Graph benefit: no CPU involvement → no D2H gaps → entire MoE forward pass
+(including all-to-all) can be captured and replayed in a single graph
+- Not a replacement for NCCL — NCCL is still better for large collectives (gradient allreduce)
+- Works with Triton + NVSHMEM for custom in-kernel transfers
+
+WHY PINNING EXISTS (non-coherent / PCIe):
+
+  The DMA engine needs a STABLE physical address to copy from.
+  
+  Regular (pageable) memory:
+    OS can swap pages to disk or move them anytime
+    → DMA engine starts reading from address 0x1000
+    → OS moves the page mid-transfer
+    → DMA reads garbage from 0x1000 (page is gone!)
+    
+    Solution: CPU must first copy to a pinned (locked) staging buffer
+    
+    [pageable RAM] → CPU copies → [pinned buffer] → DMA copies → [GPU HBM]
+                     ↑ extra step                    ↑ safe, address won't change
+    
+  Pinned memory:
+    OS CAN'T move or swap these pages
+    → DMA engine reads from stable address → works correctly
+    
+    [pinned RAM] → DMA copies directly → [GPU HBM]
+                   ↑ no extra CPU copy step
+
+WHY COHERENT SYSTEMS DON'T NEED THIS AS MUCH (NVLink-C2C):
+
+  GPU doesn't use DMA to copy from CPU RAM.
+  GPU directly ACCESSES CPU memory through the coherence protocol.
+  
+  [CPU RAM] ←── GPU reads/writes directly via NVLink-C2C ──→ [GPU]
+                ↑
+          coherence hardware tracks where pages are
+          if OS moves a page → coherence protocol updates the mapping
+          GPU always follows the correct address → no stale reads
+          
+  No DMA copy happening → no need to lock pages in place for DMA
+  The GPU is just doing memory loads/stores through a coherent link.
+
+- Data input pipeline optimization — preventing GPU idle time
+
+  Problem: GPU finishes batch → waits for next batch → idle time
+  
+  GPU: [compute]──[idle waiting for data]──[compute]──[idle]
+  CPU: [loading]────────────────────────[loading]──────────
+
+- Key DataLoader settings
+  ┌─────────────────────────┬────────────────────────────────────────────┐
+  │ pin_memory=True          │ Lock host pages → fast DMA to GPU         │
+  │                          │ Less critical on NVLink-C2C superchips    │
+  │                          │ (coherent path already fast)              │
+  ├─────────────────────────┼────────────────────────────────────────────┤
+  │ num_workers=N            │ Parallel worker processes for loading     │
+  │                          │ Heuristic: 4 per GPU, sweep 4/8/16/32    │
+  │                          │ Stop when CPU cores saturate (all 100%)   │
+  ├─────────────────────────┼────────────────────────────────────────────┤
+  │ persistent_workers=True  │ Don't respawn workers between epochs      │
+  │                          │ Avoids process startup overhead           │
+  │                          │ Important for tokenization-heavy LLM work │
+  ├─────────────────────────┼────────────────────────────────────────────┤
+  │ prefetch_factor=N        │ Each worker preloads N batches ahead      │
+  │                          │ Total prefetch = prefetch_factor × workers │
+  │                          │ Keeps pipeline full, fewer GPU stalls     │
+  │                          │ Don't overfetch → wastes CPU memory       │
+  ├─────────────────────────┼────────────────────────────────────────────┤
+  │ non_blocking=True        │ Async H2D transfer, CPU doesn't wait     │
+  └─────────────────────────┴────────────────────────────────────────────┘
+
+- Superchip (NVLink-C2C) note
+  - Coherent memory → GPU accesses CPU RAM directly, no DMA pinning needed
+  - But still use large pages + verify overlap with Nsight Systems before removing pinning
+
+- Precompute datasets
+  - Tokenize once, save to disk → skip tokenization in training loop
+  - Tools: Hugging Face Dataset.cache(), WebDataset
+  - Also: mixed precision / compression for datasets → reduce I/O bandwidth
+
+- TorchData with DataPipes
+  - PyTorch's native data loading library
+  - "Composable" = you chain small transform steps like Unix pipes:
+    read_files → decode → tokenize → batch → shuffle
+    Each step is a DataPipe, they snap together
+  - Integrates with PyTorch scheduler to overlap data loading with training
+  - Basically a cleaner, more modular replacement for old-style Dataset + DataLoader
+
+- NVIDIA DALI (Data Loading Library)
+  - Offloads data preprocessing to GPU instead of CPU
+  - CPU-based loaders: [CPU: decode JPEG → resize → augment] → copy to GPU → train
+  - DALI:              [GPU: decode JPEG → resize → augment → train] ← all on GPU
+  - Especially useful for heavy preprocessing (image/video decode, augmentations)
+  - Feeds data through a CUDA pipeline directly → no CPU bottleneck for transforms
+  - When to use: image/video workloads where CPU can't keep up with decode/augment  
+
+- Goal: GPU never waits for data → 100% SM utilization
+  - Nsight Systems: CPU thread loading next batch IN PARALLEL with GPU training
+  - No gaps in GPU timeline = pipeline is working
+
+- Larger batch size benefits (once memory freed by checkpointing/offloading)
+  - Higher arithmetic intensity (more compute per memory access)
+  - Better GPU utilization (more work per kernel launch)
+  - Less communication overhead in multi-GPU (fewer steps per epoch = fewer allreduces)
+
+- Larger batch size risks
+  - Too large → optimizer converges to sharp minima → worse generalization
+  - Monitor with TorchEval: check if validation loss degrades
+  - Gradient accumulation also increases effective batch size: batch_size × accumulation_steps
+
+- Mitigations for large-batch instability
+  - Linear learning rate scaling + warm-up period
+  - Large-batch optimizers (e.g., LAMB)
+  - Retune hyperparameters after changing batch size
+
+- Practical note
+  - Periodically retune hyperparameters (LR, batch size, etc.) as you optimize the system
+  - What was optimal before may not be optimal after memory/compute changes
+
+- DDP + torch.compile — complete picture
+
+  DDP basics:
+    - Each GPU has full model copy, processes different data
+    - After backward: allreduce to average gradients across GPUs
+    - DDP groups gradients into BUCKETS (default 25 MB each)
+    - Buckets allreduce as soon as their grads are ready → overlaps with remaining backward
+
+  Why torch.compile creates graph breaks at bucket boundaries:
+  
+  torch.compile can't put allreduce INSIDE a compiled graph because:
+    1. Compiler generates single-GPU Triton kernels — doesn't model NCCL
+    2. Allreduce must run on a SEPARATE comms stream for overlap
+    3. Fusing it into one stream would serialize compute and comms
+
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │ Model backward (4 layers, 2 buckets):                                  │
+  │   Bucket 2 = [Layer 4, Layer 3 grads]                                  │
+  │   Bucket 1 = [Layer 2, Layer 1 grads]                                  │
+  │                                                                         │
+  │ torch.compile produces:                                                 │
+  │   Compiled subgraph 2: fused kernel for Layer 4 + Layer 3 grads        │
+  │   ──── graph break (DDP inserts allreduce for bucket 2) ────           │
+  │   Compiled subgraph 1: fused kernel for Layer 2 + Layer 1 grads        │
+  │   ──── graph break (DDP inserts allreduce for bucket 1) ────           │
+  └─────────────────────────────────────────────────────────────────────────┘
+
+  Timeline (what actually runs on GPU):
+  
+  Compute stream: [subgraph 2: grad L4+L3]────[subgraph 1: grad L2+L1]────
+  Comms stream:                     [allreduce bucket 2]────[allreduce bucket 1]
+                                     ↑ overlap!              ↑ overlap with
+                                     runs while subgraph 1    next fwd pass
+                                     computes on SMs
+
+  torch._dynamo.explain() output will show:
+    "Graph break: torch.distributed.all_reduce"  ← this is expected, not a bug
+
+- Bucket size tradeoff
+
+  Many small buckets (e.g., 10 MB):
+  ┌────────────────────────────────────────────────────────────────┐
+  │ Compute: [sg5][sg4][sg3][sg2][sg1]  ← many small subgraphs   │
+  │ Comms:     [ar5][ar4][ar3][ar2][ar1] ← lots of overlap points │
+  │ + More overlap opportunities                                   │
+  │ - Less fusion within each subgraph (too small to optimize)    │
+  │ - More kernel launch overhead                                  │
+  └────────────────────────────────────────────────────────────────┘
+
+  One giant bucket (all grads):
+  ┌────────────────────────────────────────────────────────────────┐
+  │ Compute: [════════ one big compiled graph ════════]            │
+  │ Comms:                                             [allreduce] │
+  │                                                     ↑ NO overlap
+  │ + Maximum kernel fusion within the graph            (sequential)
+  │ - Zero overlap — allreduce waits for ALL grads                │
+  └────────────────────────────────────────────────────────────────┘
+
+  Default 25 MB buckets (sweet spot):
+  ┌────────────────────────────────────────────────────────────────┐
+  │ Compute: [subgraph 2 (fused)]────[subgraph 1 (fused)]        │
+  │ Comms:              [allreduce b2]────[allreduce b1]          │
+  │ + Good fusion within each subgraph                             │
+  │ + Good overlap between compute and comms                       │
+  │ → Profile to find optimal bucket size for your hardware        │
+  └────────────────────────────────────────────────────────────────┘
+
+═══ WITH BUCKETS (2 subgraphs) ═══
+
+  time(ms):  0         5         10        15        20        25
+             |─────────|─────────|─────────|─────────|─────────|
+
+  Compute    [███ grad L4+L3 ███]
+  stream:    (subgraph 2)        [███ grad L2+L1 ███]
+                                  (subgraph 1)
+
+  Comms                          [═══ allreduce ═══]
+  stream:                         bucket 2          [═══ allreduce ═══]
+                                                     bucket 1
+
+             |─────────|─────────|─────────|─────────|─────────|
+                                  ↑                   ↑
+                          subgraph 1 compute     allreduce b1
+                          OVERLAPS with          OVERLAPS with
+                          allreduce b2           next forward pass
+
+  Wall time: ~20ms  ✓
+
+
+═══ WITHOUT BUCKETS (1 giant graph) ═══
+
+  time(ms):  0         5         10        15        20        25        30
+             |─────────|─────────|─────────|─────────|─────────|─────────|
+
+  Compute    [███████████ grad L4+L3+L2+L1 ███████████]
+  stream:    (one big fused graph)                      IDLE zzz...
+
+  Comms                                                 [════ allreduce ════]
+  stream:                                                all grads at once
+
+             |─────────|─────────|─────────|─────────|─────────|─────────|
+                                                        ↑
+                                                  GPU SMs doing NOTHING
+                                                  while allreduce runs
+                                                  = wasted 10ms
+
+  Wall time: ~30ms  ✗  (10ms slower)
+
+
+═══ THE DIFFERENCE ═══
+
+  Buckets:     [compute][compute]       = 20ms total
+                     [comms][comms]        (comms hidden behind compute)
+
+  No buckets:  [════ compute ════][comms] = 30ms total
+                                   ↑ exposed, not hidden
+
+┌──────────┬────────────────┬──────────────┐
+│          │ Model weights   │ Data          │
+├──────────┼────────────────┼──────────────┤
+│ DDP      │ Full copy       │ Own batch     │
+│ FSDP     │ 1/N shard       │ Own batch     │
+└──────────┴────────────────┴──────────────┘
+  Both process DIFFERENT data on EVERY GPU.
+
+DDP:
+  ┌─── GPU 0 ───┐     ┌─── GPU 1 ───┐
+  │ FULL model   │     │ FULL model   │
+  │ FULL optim   │     │ FULL optim   │
+  │ Batch A      │     │ Batch B      │
+  └──────┬───────┘     └──────┬───────┘
+         │                    │
+  Forward:                    │
+         │  no comms          │  ← both GPUs already have all weights
+         │  (independent)     │
+         │                    │
+  Backward:                   │
+         │  allreduce grads   │  ← average grads across GPUs (once)
+         └────────────────────┘
+  
+  Optimizer: each GPU updates its full model copy identically
+
+
+FSDP:
+  ┌─── GPU 0 ───┐     ┌─── GPU 1 ───┐
+  │ 1/2 model    │     │ 1/2 model    │
+  │ 1/2 optim    │     │ 1/2 optim    │
+  │ Batch A      │     │ Batch B      │
+  └──────┬───────┘     └──────┬───────┘
+         │                    │
+  Forward (per layer):        │
+         │  allgather weights │  ← borrow missing shards
+         │  compute layer     │
+         │  discard borrowed  │  ← free memory immediately
+         │                    │
+  Backward (per layer):       │
+         │  allgather weights │  ← borrow shards again (discarded in fwd)
+         │  compute grads     │
+         │  reduce-scatter    │  ← send each grad piece to its owner
+         │  discard borrowed  │
+         └────────────────────┘
+
+  Optimizer: each GPU updates ONLY its owned shard
+
+
+One-liner:
+  DDP  = store everything, zero fwd comms, allreduce grads once
+  FSDP = store a slice, gather before every layer, scatter after every layer
+
+- FSDP + torch.compile — per-block wrapping is key
+
+  Same principle as DDP buckets: break into subgraphs so comms overlap with compute
+
+  ┌─────────────────────┬──────────────────────────────────────────────┐
+  │ Wrap full model in   │ Wrap each transformer block in FSDP          │
+  │ one FSDP instance    │ (recommended)                                │
+  │ (BAD)                │ (GOOD)                                       │
+  ├─────────────────────┼──────────────────────────────────────────────┤
+  │ One big compiled     │ One compiled graph per block                 │
+  │ graph                │                                              │
+  │ Comms at the end     │ Comms between graphs (allgather/reduce-      │
+  │ only → no overlap    │ scatter) → overlaps with next block's compute│
+  │ All weights in       │ Only one block's weights in memory at a time │
+  │ memory at once       │                                              │
+  └─────────────────────┴──────────────────────────────────────────────┘
+
+  Per-block timeline:
+  Compute: [compiled B0][compiled B1][compiled B2][compiled B3]
+  Comms:        [ag B1]       [ag B2]      [ag B3]
+                 ↑ overlap     ↑ overlap    ↑ overlap
+
+- How to set it up
+  - transformer_auto_wrap_policy → auto-wraps each TransformerBlock
+  - use_orig_params=True → no flattening, better overlap and optimizer compat
+  - TorchDynamo auto-inserts graph breaks at FSDP shard boundaries
+  - Mirrors DDP's bucketed approach but with allgather/reduce-scatter instead of allreduce  
+═══ Setup: 4 transformer blocks, 2 GPUs ═══
+
+  Full model:
+  [Embedding] → [Block 0] → [Block 1] → [Block 2] → [Block 3] → [Output Head]
+
+  Each block = 10 GB weights (attention + FFN + norms)
+
+
+═══ How FSDP shards it ═══
+
+  Each block's weights split in half across 2 GPUs:
+
+  GPU 0 stores:                        GPU 1 stores:
+  ┌──────────────────────┐             ┌──────────────────────┐
+  │ Embed shard (0.5 GB) │             │ Embed shard (0.5 GB) │
+  │ Block 0 shard (5 GB) │             │ Block 0 shard (5 GB) │
+  │ Block 1 shard (5 GB) │             │ Block 1 shard (5 GB) │
+  │ Block 2 shard (5 GB) │             │ Block 2 shard (5 GB) │
+  │ Block 3 shard (5 GB) │             │ Block 3 shard (5 GB) │
+  │ Head shard (0.5 GB)  │             │ Head shard (0.5 GB)  │
+  ├──────────────────────┤             ├──────────────────────┤
+  │ Total: 21 GB stored  │             │ Total: 21 GB stored  │
+  └──────────────────────┘             └──────────────────────┘
+  vs. 42 GB if full model on each GPU (DDP)
+
+
+═══ FORWARD PASS — one block at a time ═══
+
+  Step 1: Block 0
+  ┌──────────────────────────────────────────────────────────────┐
+  │ GPU 0 has 5 GB shard, GPU 1 has 5 GB shard                  │
+  │                                                              │
+  │    allgather: GPU 0 ←→ GPU 1 exchange shards                │
+  │    Both GPUs now have FULL 10 GB Block 0 weights             │
+  │                                                              │
+  │ GPU 0: fwd(Block 0, batch A) → activations A0               │
+  │ GPU 1: fwd(Block 0, batch B) → activations B0               │
+  │                                                              │
+  │    Drop borrowed 5 GB shard → back to 5 GB each             │
+  └──────────────────────────────────────────────────────────────┘
+
+  Step 2: Block 1 (OVERLAPPED with Block 0 drop)
+  ┌──────────────────────────────────────────────────────────────┐
+  │    allgather Block 1 shards (can start during Block 0 compute)
+  │    Both GPUs now have FULL 10 GB Block 1 weights             │
+  │                                                              │
+  │ GPU 0: fwd(Block 1, activations A0) → activations A1        │
+  │ GPU 1: fwd(Block 1, activations B0) → activations B1        │
+  │                                                              │
+  │    Drop borrowed shard                                       │
+  └──────────────────────────────────────────────────────────────┘
+
+  ...Block 2, Block 3 same pattern...
+
+  Forward timeline (GPU 0):
+  time:   0      5     10     15     20     25     30     35
+          |──────|──────|──────|──────|──────|──────|──────|
+  Comms: [ag B0]     [ag B1]      [ag B2]      [ag B3]
+          gather      gather       gather       gather
+  Comp:       [fwd B0]     [fwd B1]      [fwd B2]      [fwd B3]
+               ↑             ↑              ↑             ↑
+          uses full      uses full     uses full     uses full
+          10 GB weights  10 GB         10 GB         10 GB
+
+  Memory:  15 GB   10 GB   15 GB   10 GB   15 GB   10 GB
+           peak    drop    peak    drop    peak    drop
+           (5 own + 10 full block)
+
+  Peak forward memory: ~15 GB (own shards + one full block)
+  vs. 42 GB if everything loaded at once
+
+
+═══ BACKWARD PASS — reverse order, allgather + reduce-scatter ═══
+
+  Step 1: Block 3 (last block first in backward)
+  ┌──────────────────────────────────────────────────────────────┐
+  │    allgather Block 3 weights (need them again for grads)     │
+  │                                                              │
+  │ GPU 0: bwd(Block 3, saved activations) → grad_W3            │
+  │ GPU 1: bwd(Block 3, saved activations) → grad_W3            │
+  │                                                              │
+  │    reduce-scatter grad_W3:                                   │
+  │      GPU 0 gets averaged grad for its shard of W3            │
+  │      GPU 1 gets averaged grad for its shard of W3            │
+  │    Drop borrowed weights                                     │
+  └──────────────────────────────────────────────────────────────┘
+
+  Step 2: Block 2 (OVERLAPPED with Block 3 reduce-scatter)
+  ┌──────────────────────────────────────────────────────────────┐
+  │    allgather Block 2 weights                                 │
+  │    bwd(Block 2) → grad_W2                                   │
+  │    reduce-scatter grad_W2                                    │
+  │    Drop borrowed weights                                     │
+  └──────────────────────────────────────────────────────────────┘
+
+  ...Block 1, Block 0 same pattern...
+
+  Backward timeline (GPU 0):
+  time:   0      5     10     15     20     25     30     35     40
+          |──────|──────|──────|──────|──────|──────|──────|──────|
+  Comms: [ag B3]     [rs B3 + ag B2]    [rs B2 + ag B1]    [rs B1 + ag B0]
+  Comp:       [bwd B3]          [bwd B2]          [bwd B1]          [bwd B0]
+
+  ag = allgather weights (borrow)
+  rs = reduce-scatter grads (send each piece to owner)
+  Both overlap with next block's compute!
+
+
+═══ After backward — optimizer step ═══
+
+  GPU 0: has averaged grads for its shards only → updates its shards
+  GPU 1: has averaged grads for its shards only → updates its shards
+  No comms needed for optimizer step!
+
+
+═══ Benefits summary ═══
+
+  ┌────────────┬──────────────────────────────────────────────────┐
+  │ Memory     │ Only 1 block fully materialized at a time        │
+  │            │ Peak = own shards + 1 full block (not all blocks)│
+  ├────────────┼──────────────────────────────────────────────────┤
+  │ Forward    │ allgather per block, overlapped with prev compute│
+  │            │ Drop borrowed weights immediately after use      │
+  ├────────────┼──────────────────────────────────────────────────┤
+  │ Backward   │ allgather + reduce-scatter per block             │
+  │            │ Both overlapped with next block's compute        │
+  ├────────────┼──────────────────────────────────────────────────┤
+  │ Optimizer  │ Each GPU updates only its owned shards           │
+  │            │ No comms needed                                  │
+  └────────────┴──────────────────────────────────────────────────┘
+
+- FSDP + torch.compile wrap-up
+
+  - Prefetching: while block N computes, block N+1's weights allgathered async → hides comms
+  - Training loop unchanged — auto_wrap_policy handles per-block FSDP nesting automatically
+  - torch._dynamo.explain() will show graph breaks at each FSDP boundary → expected, not a bug
+
+  Per-block benefits:
+  ┌────────────┬──────────────────────────────────────────────┐
+  │ Memory     │ One block's full weights at a time            │
+  │ Compute    │ Each block = one compiled, fused graph        │
+  │ Comms      │ allgather/reduce-scatter overlapped with      │
+  │            │ next block's compute via prefetch              │
+  │ Code       │ Specify block class once, FSDP handles rest   │
+  └────────────┴──────────────────────────────────────────────┘    

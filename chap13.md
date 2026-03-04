@@ -1298,3 +1298,286 @@ One-liner:
   │            │ next block's compute via prefetch              │
   │ Code       │ Specify block class once, FSDP handles rest   │
   └────────────┴──────────────────────────────────────────────┘    
+
+3/4/26:
+
+- torch.compile + TP/PP — separation of concerns
+
+  ┌──────────────────────────────────────────────────────────────┐
+  │            What torch.compile optimizes                      │
+  │                                                              │
+  │  Python code → TorchDynamo → AOT Autograd → TorchInductor   │
+  │                                                    ↓         │
+  │                                    Fused Triton/cuBLAS/cuDNN │
+  │                                    kernels for MATH ops      │
+  │                                                              │
+  │  Scope: compute WITHIN each GPU's segment                    │
+  │  (matmul, activation, layernorm, dropout, etc.)              │
+  └──────────────────────────────────────────────────────────────┘
+
+  ┌──────────────────────────────────────────────────────────────┐
+  │            What distributed strategy handles                 │
+  │                                                              │
+  │  DDP:  allreduce grads (bucketed)                            │
+  │  FSDP: allgather weights + reduce-scatter grads (per block)  │
+  │  TP:   allreduce/allgather within layer (per matmul)         │
+  │  PP:   send/recv activations between stages                  │
+  │                                                              │
+  │  Scope: NCCL collectives BETWEEN GPUs                        │
+  │  torch.compile does NOT touch these                          │
+  └──────────────────────────────────────────────────────────────┘
+
+  How they coexist:
+
+  ┌─────────────────────────────────┐
+  │ Compiled graph (fused compute)  │──── graph break
+  └─────────────────────────────────┘         ↓
+                                      [NCCL collective]  ← handled by DDP/FSDP/TP/PP
+                                              ↓
+  ┌─────────────────────────────────┐
+  │ Compiled graph (fused compute)  │──── graph break
+  └─────────────────────────────────┘         ↓
+                                      [NCCL collective]
+                                              ↓
+                                          ...repeat
+
+  Compiler fuses math inside each segment
+  Distributed strategy handles comms between segments
+  Neither touches the other's job
+
+- Practical checklist
+  ┌─────────────────────────────────────────────────────────────┐
+  │ 1. torch.compile optimizes compute, not comms               │
+  │ 2. NCCL collectives left as-is (ordering, schedule, stream) │
+  │ 3. Graph breaks at collective boundaries → expected          │
+  │ 4. Always test with AND without compile → compare results   │
+  │ 5. Profile with Nsight Systems → verify overlap preserved   │
+  │ 6. Check torch._dynamo.explain() for unexpected breaks      │
+  │    (allreduce breaks = normal, other breaks = investigate)   │
+  └─────────────────────────────────────────────────────────────┘
+
+- TorchTitan, AsyncTP, AutoParallel, SimpleFSDP
+
+  ┌──────────────┬─────────────────────────────────────────────────────────────┐
+  │ TorchTitan    │ Reference implementations for large-scale training         │
+  │               │ Composes FSDP + TP + PP + AsyncTP recipes                  │
+  │               │ Uses DTensor as the core sharding primitive                │
+  ├──────────────┼─────────────────────────────────────────────────────────────┤
+  │ AsyncTP       │ Overlaps TP collectives with compute using dual streams    │
+  │               │ SM-wave aware schedule: stagger allgather so it overlaps   │
+  │               │ with next matmul wave                                      │
+  │               │                                                            │
+  │               │ Traditional TP:                                            │
+  │               │   [matmul]──[allgather]──[matmul]──[allgather]             │
+  │               │              ↑ idle SMs                                    │
+  │               │                                                            │
+  │               │ AsyncTP:                                                   │
+  │               │   [matmul wave 1]──[matmul wave 2]──                       │
+  │               │        [allgather]──────                                   │
+  │               │         ↑ overlapped with next wave's compute              │
+  │               │                                                            │
+  │               │ Enabled via torch.compile — fuses matmuls with             │
+  │               │ allgather/reduce-scatter                                   │
+  ├──────────────┼─────────────────────────────────────────────────────────────┤
+  │ AutoParallel  │ Automatically plans FSDP + TP + PP combinations            │
+  │               │ Heuristic-based: considers memory and comms costs          │
+  │               │ per workload                                               │
+  │               │ Built on DTensor (PyTorch's native sharding primitive)     │
+  │               │ Reduces manual parallelization tuning                      │
+  ├──────────────┼─────────────────────────────────────────────────────────────┤
+  │ SimpleFSDP    │ FSDP reimplemented to be torch.compile-friendly            │
+  │               │ Uses DTensor + selective activation checkpointing           │
+  │               │ TorchInductor buckets and reorders IR nodes for            │
+  │               │ better compute-comms overlap                               │
+  │               │ Results: ~28% less memory, up to ~69% faster than          │
+  │               │ traditional FSDP2 eager path                               │
+  └──────────────┴─────────────────────────────────────────────────────────────┘
+
+  How they relate:
+  ┌──────────────────────────────────────────────────┐
+  │ TorchTitan (reference recipes)                    │
+  │  ├── AsyncTP (overlapped TP collectives)          │
+  │  ├── AutoParallel (auto plan FSDP+TP+PP)          │
+  │  ├── SimpleFSDP (compile-friendly FSDP)           │
+  │  └── All built on DTensor (sharding primitive)    │
+  └──────────────────────────────────────────────────┘
+
+═══ Normal TP (one matmul at a time) ═══
+
+  TP allreduce/allgather happens AFTER matmul finishes:
+
+  SMs:        [███ matmul ███]  [idle]  [███ matmul ███]  [idle]
+  NVLink:                       [ag]                      [ag]
+                                 ↑ SMs waiting              ↑ SMs waiting
+  
+  Problem: SMs sit idle during allgather
+
+
+═══ What is a "wave"? ═══
+
+  A matmul launches thousands of thread blocks.
+  GPU can only run ~160 blocks at once (160 SMs on Blackwell).
+  If matmul needs 320 blocks → runs in 2 WAVES:
+
+  Wave 1: blocks 0-159   (fills all SMs)
+  Wave 2: blocks 160-319 (fills all SMs again)
+
+  SMs:  [wave 1: all SMs busy][wave 2: all SMs busy] → matmul done
+
+
+═══ AsyncTP trick: start allgather during LAST wave ═══
+
+  Insight: during the last wave of a matmul, some SMs finish early
+  and sit idle. Use that idle time to start the allgather!
+
+  Normal TP:
+  SMs:     [wave1][wave2][idle][wave1][wave2][idle]
+  NVLink:                [ag]                [ag]
+                          ↑ wasted time
+
+  AsyncTP (dual streams):
+  Stream 1 (compute): [wave1][wave2]     [wave1][wave2]
+  Stream 2 (comms):          [allgather]──┘     [allgather]──
+                              ↑                   ↑
+                        starts during         starts during
+                        wave 2 of prev        wave 2 of prev
+                        matmul (SMs not       matmul
+                        all busy at tail)
+
+  "Dual streams" = one stream for matmul, one stream for allgather
+  "SM-wave aware" = knows when the last wave has leftover SMs → starts comms there
+  "Stagger" = allgather starts before matmul fully finishes
+
+- HTA (Holistic Trace Analysis) — Meta's multi-GPU profiling tool
+
+  Problem: N GPUs = N separate traces → impossible to manually compare
+
+  ┌──────────────────────────────────────────────────────────────────┐
+  │ torch.profiler (each rank) → JSON traces → HTA merges + aligns  │
+  │                                                                  │
+  │  Rank 0: [fwd]────[bwd]────[idle]────[allreduce]────            │
+  │  Rank 1: [fwd]────[bwd]──────────[bwd]──[allreduce]──           │
+  │  Rank 2: [fwd]────[bwd]────[idle]────[allreduce]────            │
+  │                              ↑              ↑                    │
+  │                     HTA spots this:  straggler + sync issue      │
+  └──────────────────────────────────────────────────────────────────┘
+
+- What HTA shows
+  - Unified timeline: all GPUs aligned by time with NVTX markers
+  - GPU idle times per rank → find stragglers
+  - Sync gaps: which rank is waiting for which (e.g., allreduce bottleneck)
+  - Load imbalance: rank 0 finishes early, sits idle while others compute
+  - Suggestions for improving overlap
+
+- Verifying optimizations with HTA
+  Before (no overlap):
+    [backward]──[gap]──[allreduce]──[next compute]
+
+  After (bucketed overlap):
+    [backward]──────────────────
+            [allreduce]──────    ← gap shrinks/disappears
+
+- Workflow
+  1. torch.profiler.schedule → record traces for a few iterations per rank
+  2. Save JSON traces to shared location
+  3. Load into HTA → unified timeline + analysis
+
+- Note: TensorBoard profiler plugin deprecated (as of 2025)
+  Use Perfetto for single-trace timelines, HTA for multi-GPU aggregation
+
+- CI performance regression testing
+
+  Optimize once is not enough → must protect gains as code/PyTorch versions evolve
+
+  Workflow:
+  ┌──────────────────────────────────────────────────────────────────┐
+  │ Code commit → CI triggers → TorchBench runs model → JSON output │
+  │                                                        ↓        │
+  │                              compare_perf.py(baseline.json, results.json)
+  │                                                        ↓        │
+  │                              ≥5% slower? → FAIL build             │
+  │                              OK? → pass                           │
+  └──────────────────────────────────────────────────────────────────┘
+
+  What to track in CI:
+  ┌────────────────────────────┬────────────────────────────────────┐
+  │ Throughput                  │ tokens/sec or samples/sec          │
+  │ Memory                     │ torch.cuda.max_memory_allocated()  │
+  │ Data loading time          │ time the actual data pipeline      │
+  │ Correctness                │ torch.allclose() with strict tols  │
+  └────────────────────────────┴────────────────────────────────────┘
+
+  Avoid false alarms:
+  - Run multiple iterations before failing
+  - Require regression sustained over 3+ runs
+  - Use statistical smoothing (PyTorch's own approach)
+  - Use consistent hardware / reserved cloud instances
+
+- TorchBench
+  - Open source suite of PyTorch model benchmarks
+  - Includes torch.compile benchmarks for compiler perf tracking
+  - Can add your own model: fork TorchBench, add model, run in CI
+
+- Correctness testing
+  - Custom kernels must match PyTorch's reference ops
+  - Test edge cases (large values → overflow, random seeds)
+  - torch.allclose() for numerical accuracy
+
+- PyTorch HUD (Performance Dashboard)
+  - Public web UI tracking nightly benchmark results across models + hardware
+  - Shows: throughput, compilation time, memory, FLOPS utilization over time
+  - ~5% regression threshold → flagged in red → investigation
+  - Trend lines catch gradual decay from many small commits
+  - Tracks vLLM, common LLMs across NVIDIA/AMD GPUs and CPUs
+  - Open source (pytorch/test-infra) → can mimic for your own models
+  - Correlates perf changes directly with GitHub commits
+
+- Key takeaway
+  ┌─────────────────────────────────────────────────────────────────┐
+  │ Performance is multidimensional:                                │
+  │   20% faster compute + 200% more memory = net negative          │
+  │                                                                 │
+  │ Track all dimensions in CI, not just speed                      │
+  │                                                                 │
+  │ Even PyTorch updates can regress your workload —                │
+  │ catch early, report upstream, PyTorch team is responsive        │
+  └─────────────────────────────────────────────────────────────────┘
+
+- MLPerf logging — structured performance tracking
+
+  Format: JSON log entries with :::MLL prefix, timestamped to millisecond
+  Library: open source MLPerf Logging on GitHub
+
+  Example breakdown per training step:
+  ┌─────────────────────────┬──────────┬────────┐
+  │ Component                │ Time     │ %      │
+  ├─────────────────────────┼──────────┼────────┤
+  │ Forward pass             │ 10.5 ms  │ 43.8%  │
+  │ Backward pass            │ 9.0 ms   │ 37.5%  │
+  │ All-reduce (grad sync)   │ 4.0 ms   │ 16.7%  │
+  │ Other overhead           │ 0.5 ms   │ 2.1%   │
+  ├─────────────────────────┼──────────┼────────┤
+  │ Total step               │ 24.0 ms  │ 100%   │
+  └─────────────────────────┴──────────┴────────┘
+  → tells you exactly where to optimize (e.g., 16.7% in allreduce → try async overlap)
+
+- Why structured logging matters
+  - Pairs performance with accuracy (can't claim speed without meeting accuracy target)
+  - Makes results reproducible and debuggable
+  - Track trends over long runs (did memory fragmentation slow things down on day 7?)
+  - Communicate bottlenecks to team in standardized format
+
+- MLPerf compliance
+  - Scripts verify: no hyperparameter changes after start, correct epochs, target accuracy met
+  - Ensures fair apples-to-apples comparison across submissions
+
+- Practical takeaway (even without competing)
+  ┌─────────────────────────────────────────────────────────────────┐
+  │ Log JSON per epoch/step:                                       │
+  │   throughput, latency, fwd/bwd/comms breakdown,                │
+  │   GPU utilization (nvidia-smi), memory usage                   │
+  │                                                                │
+  │ Plot over time → spot regressions, fragmentation, bottlenecks  │
+  │                                                                │
+  │ Study MLPerf submissions → best practices for LLMs + clusters  │
+  └─────────────────────────────────────────────────────────────────┘  

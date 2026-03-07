@@ -492,4 +492,37 @@ Tips for Handling Graph Breaks
   FSDP (Fully Sharded Data Parallel):
     - Wrap each transformer block as its own FSDP submodule
     - Dynamo breaks at each submodule boundary → allows shard comms to overlap with compute
-    - Same idea as DDP buckets — intentional breaks for overlap    
+    - Same idea as DDP buckets — intentional breaks for overlap
+
+
+  Compiled FSDP memory benefits:
+    - AOT Autograd + Inductor fuse fwd/bwd passes, reuse buffers across shards
+    - Only active parameter slices + minimal intermediates resident per GPU → lower peak memory vs DDP/eager
+    - Wrap submodules individually (each transformer block) — otherwise falls back to one big bucket (less overlap, less memory savings)
+    - Always test on small config first — debugging compiled FSDP at scale is very complex
+
+  Custom CUDA/Triton ops:
+    - Unknown custom CUDA C++ extensions → Dynamo can't reason about them → graph break
+    - Fix: rewrite in Triton + register via torch.library.triton_op() → compiler can optimize it
+    - Check if third-party libraries already provide Triton/Dynamo wrappers before writing your own
+
+Debugging Compiler Phases, Graph Breaks, and Performance
+
+  TORCH_LOGS (env var) — pick what to debug:
+    - graph_breaks    → when/where graphs split
+    - recompiles      → what triggers recompilation
+    - guards          → guard evaluations (shape, dtype, etc.)
+    - perf_hints      → missed optimization opportunities
+    - output_code     → generated kernel source code
+    - dynamo          → verbose TorchDynamo internals
+    - aot_graphs      → verbose AOT Autograd internals
+    - inductor        → verbose TorchInductor internals
+    - dynamic         → dynamic shape decisions
+
+  Deeper debugging:
+    - TORCH_COMPILE_DEBUG=1 → full debug dir (FX graph, IR, Triton source, HTML report)
+    - TORCHDYNAMO_REPRO_AFTER + REPRO_LEVEL → dump graph per stage, compare vs eager
+    - TORCH_TRACE=<dir> + tlparse → stack-frame tree of compilation events
+    - Perfetto UI → trace timeline visualization (low overhead, usable in production)
+
+  Tip: start with just "graph_breaks" — output gets very verbose quickly

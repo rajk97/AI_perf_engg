@@ -414,3 +414,82 @@ WHAT GRAPH BREAKS LOOK LIKE:
 - Fix print: wrap in `if not torch._dynamo.is_compiling()`
 - Fix data-dependent if: refactor to torch.where() or accept the break
 - Goal: one big graph for the whole model/training step  
+
+Handling Data-Dependent Branches (Avoiding Graph Breaks)
+
+PROBLEM:
+  if b.sum() < 0:    ← Python if on tensor value = GRAPH BREAK
+      b = -b
+
+FIX 1: torch.cond() — captures BOTH branches as graph subroutines
+  b = torch.cond(b.sum() < 0, lambda b: -b, lambda b: b, (b,))
+  ✅ no graph break
+  ❌ restrictions: same input/output shape+dtype, no side effects, tensor predicate only
+
+FIX 2: torch.where() — pure tensor masking, no branches at all
+  b = torch.where(b.sum() < 0, -b, b)
+  ✅ no graph break, no restrictions, simpler
+  ❌ computes BOTH -b and b always (minor waste)
+
+- Python `if` on tensor values = graph break (compiler must pick one path)
+- torch.cond() = both branches captured in graph, GPU picks at runtime (like GPU if/else)
+- torch.where() = mask-based selection, no branching at all — simpler and preferred
+- Use torch.where() when possible; torch.cond() when branches are complex/different ops
+
+WHAT TRIGGERS RECOMPILATION:
+═══════════════════════════════════════════════════════════════
+
+  1. Dynamic shape guard fails       (seq_len exceeded range)
+  2. Data-dependent branch changes    (if b.sum()<0 took other path)
+  3. New tensor dtype/device seen
+  4. Python global variable changed
+
+- fail_on_recompile = crash on any guard violation instead of silently recompiling → catches graph breaks early in dev/CI
+
+Minimize Graph Recompilations
+- Symptom: iterations stay slow after warmup → likely excessive recompiles
+- Debug: TORCH_LOGS="graph_breaks,recompiles,guards" → see which guard is failing
+- Common cause: Python-level value (seed, timestamp, counter) changing every iter → guard on exact value → recompile
+- Fix varying constants: pass as tensor (compiler guards shape/dtype, not value)
+- Fix varying shapes: mark_dynamic(tensor, dim) → symbolic from start, skips discovery recompile
+- Safety net: set_stance("eager_on_recompile") → caps recompiles, falls back to eager after N failures
+
+- Constants: recompilations are totally unnecessary — value changes but nothing structural (shape/memory) changes. As a tensor, value flows as runtime data, not a compile-time constant.
+- mark_dynamic: tells compiler to use SymPy from the start — it already knows the dim is dynamic, no wasted discovery recompile.
+- Both = "tell the compiler upfront what varies, so it doesn't learn the hard way."
+
+Mark Functions and Code Blocks as Safe with allow_in_graph:
+
+- allow_in_graph = tell Dynamo "trust me, this function is pure" → skip safety checks → no graph break
+- Use as decorator (@torch._dynamo.allow_in_graph) or context manager
+- You're promising: no side effects, same input → same output, depends only on tensor inputs
+- If you're wrong → silent wrong results (no error, just bad math)
+- Last resort — fix the actual graph break cause first, use this only when you're sure it's safe
+
+Tips for Handling Graph Breaks
+
+  In-place operations:
+    - x.relu_() creates aliasing ambiguity → compiler can't track which version of x each node sees → may break
+    - Fix: rewrite to out-of-place x = x.relu()
+
+  Python data structures:
+    - Avoid Python lists/loops for tensors → use torch.stack(), preallocate instead
+    - Remove print, logging, math.*, I/O from perf-critical paths
+
+  General rule:
+    - Stay in PyTorch tensor ops, avoid Python-native equivalents
+
+  Data-dependent control flow:
+    - if tensor.sum() > 0: → unknown at compile time → graph break
+    - Fix: torch.where()/masks (preferred), torch.cond() for complex branches
+    - If neither works → accept the break
+
+  DDP (Distributed Data Parallel):
+    - Graph breaks at all-reduce buckets are INTENTIONAL — needed for compute/comms overlap
+    - Each bucket compiled separately so gradient sync overlaps with next bucket's backward
+    - Can't eliminate these breaks — they're necessary for efficient distributed training
+
+  FSDP (Fully Sharded Data Parallel):
+    - Wrap each transformer block as its own FSDP submodule
+    - Dynamo breaks at each submodule boundary → allows shard comms to overlap with compute
+    - Same idea as DDP buckets — intentional breaks for overlap    

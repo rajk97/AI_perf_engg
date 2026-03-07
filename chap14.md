@@ -335,5 +335,82 @@ HOW IT WORKS:
 - SymPy does algebra through optimization passes so S stays symbolic (e.g., ceil(S/32) not ceil(73/32)=3)
 - At launch time, S is just a kernel argument — no recompilation needed
 
+- Guard = valid range for a symbolic dim (e.g., S ≤ 256); kernel reused for any S within range
+- Guard fails → recompile with wider range → cache grows over time
+- Data-dependent control flow = branches on tensor VALUES (not shapes) → can't symbolize → forces specialization + frequent recompiles
+- Tip: bucket inputs by size to limit distinct shapes; use dynamic shapes for remaining variability
+- Dynamic shapes consistently outperform padding (less wasted compute, less compile time)
+
+TRADEOFF:
+  Fixed shapes + padding       vs       Dynamic shapes (symbolic)
+  ─────────────────────────             ─────────────────────────
+  CUDA Graphs work ✅                   CUDA Graphs disabled ❌
+  No recompiles ✅                      Occasional recompiles ❌
+  Wasted compute on padding ❌          No wasted compute ✅
+  Best when lengths vary <20%           Best when lengths vary widely
+
+  - dynamic=True disables CUDA Graphs (graphs need fixed shapes + fixed memory addresses)
+- mode="reduce-overhead" = CUDA Graphs → only with stable shapes
+- mode="default" or "max-autotune-no-cudagraphs" → for variable lengths
+- If lengths vary ≤20% → pad to fixed size + CUDA Graphs is often faster
+- If lengths vary widely → dynamic shapes avoids massive padding waste
+- Dynamic shapes = slightly higher memory (extra guards + generalized code)
+- Always profile both approaches for your workload
+
+Disabling the PyTorch Compiler and Reverting Back to Eager Mode
+
+- @torch.compiler.disable decorator → disable compilation for a specific function
+- torch.compiler.set_stance() → context manager for region-scoped control (eager within a block)
+- torch.compile(model, backend="eager") → revert entire model to eager mode
+- Use cases: A/B testing compiled vs eager, isolating issues, skipping untraceable code, keeping graph focused on compute
+
+The "SymPy symbolic tracing" sounds fancy, but the end result is just: don't hardcode the size, pass it as an argument.
+
+Performance Hints and Debugging Generated Code
+
+- TORCH_LOGS="perf_hints" → shows missed optimizations (why fusion/CUDA Graphs failed)
+- TORCH_LOGS="output_code" → prints generated kernel source code
+- TORCH_COMPILE_DEBUG=1 → full debug dir with FX graph, IR dumps, Triton sources, PTX
+- Use these to verify fusion, warp specialization, Tensor Core usage (mma.sync in PTX)
+- Spot inefficiency → write custom Triton kernel for that specific pattern
+
+Debugging Numerical Correctness and Accuracy
+
+- torch.compile CAN introduce numerical differences vs eager mode (rare but possible)
+- Causes: kernel fusion reorders FP math, mixed precision (BF16/FP16) in fused ops, RNG sequence changes
+- Debug: minifier → smallest repro script; REPRO_AFTER="aot" + REPRO_LEVEL=4 → compare each compiler stage vs eager
+- Random mismatch: fallback_random=True forces eager-matching RNG (slower)
+- FP mismatch: test in full FP32 + set_float32_matmul_precision('highest') to isolate
+- Determinism: torch.use_deterministic_algorithms(True) + CUBLAS_WORKSPACE_CONFIG=:4096:8 (cuBLAS split-K is nondeterministic by default)
+- torch._dynamo.explain() → overview of graph breaks and subgraphs
+
+Explaining and Minimizing Graph Breaks
+
+WHAT GRAPH BREAKS LOOK LIKE:
+═══════════════════════════════════════════════════════════════
+
+  YOUR CODE:
+    x = a / (abs(a) + 1)      ─┐
+                                ├── Graph 1 (compiled, fast)
+    print("woo")               ─┘ ← BREAK (side effect)
+                                   ← eager Python runs print()
+    if b.sum() < 0:            ─┐
+        b = -b                  ├── Graph 2 (compiled, fast)
+                               ─┘ ← BREAK (data-dependent branch)
+                                   ← eager Python picks branch
+    return x * b               ─── Graph 3 (compiled, fast)
 
 
+  IDEAL (no breaks):           REALITY (with breaks):
+  ┌────────────────────┐       ┌──────┐ eager ┌──────┐ eager ┌──────┐
+  │  ONE BIG GRAPH     │       │Graph1│►print►│Graph2│►if/el►│Graph3│
+  │  (fully optimized) │       └──────┘       └──────┘       └──────┘
+  └────────────────────┘       ↑ each gap = Python overhead + lost fusion
+
+- Graph break = compiler gives up, falls back to eager Python for that line
+- Each break = lost fusion opportunity + Python overhead between graphs
+- Common causes: print(), data-dependent if, unsupported ops, collective comms (FSDP)
+- Debug: dynamo.explain(model)(inputs) → shows break count, exact lines, reasons
+- Fix print: wrap in `if not torch._dynamo.is_compiling()`
+- Fix data-dependent if: refactor to torch.where() or accept the break
+- Goal: one big graph for the whole model/training step  

@@ -286,3 +286,54 @@ Compiler modes vs features used
 
   dynamic=True with any mode → CUDA Graphs disabled (shapes must be static for capture)
 
+Starting at 618: 12:30 || 22.5 pages to go 
+
+TorchInductor routing:
+  Your model → torch.compile
+                  ├── large GEMMs ──────→ cuBLAS/CUTLASS (hand-tuned)
+                  ├── fusable patterns ──→ Triton kernels (auto-generated)
+                  └── caches best path per shape
+
+  Transformer example:
+  [layernorm + residual] ← fused Triton → [GEMM] ← cuBLAS → [activation] ← fused Triton
+
+- Inductor fuses elementwise chains into one kernel; delegates large GEMMs to cuBLAS
+- NVIDIA TE: NOT auto-used — must call TE modules explicitly; torch.compile fuses around them
+- FlexAttention: compiles to fused Triton kernels (~85-90% FlashAttention perf, more flexible)
+- Triton auto-enables warp specialization + TMA on Hopper/Blackwell when beneficial
+- First compile = slow (autotune); subsequent runs = cached + fast  
+
+Dynamic Shapes and Variable Sequence Lengths:
+
+"Symbolic = algebra, not padding. One kernel fits a range, not one size."
+
+HOW IT WORKS:
+═══════════════════════════════════════════════════════════════
+
+  1st call: seq_len=73
+    Compiler: "I'll assume seq_len is static = 73"
+    → compiles kernel A (for exactly 73)
+
+  2nd call: seq_len=100
+    Compiler: "shape changed! recompile once"
+    → sets guard: seq_len ≤ 256 (dynamic from now on)
+    → compiles kernel B with symbolic dim "S" where S ≤ 256
+    → kernel B works for ANY seq_len ≤ 256
+
+  3rd call: seq_len=42  → reuses kernel B ✅ (42 ≤ 256)
+  4th call: seq_len=200 → reuses kernel B ✅ (200 ≤ 256)
+  5th call: seq_len=500 → guard violated! recompile → new guard S ≤ 1024
+
+  - No padding — kernel handles the exact input size using symbolic dimensions
+- SymPy represents unknown dims as math symbols → generated code has flexible grid/block sizes
+- Guards (e.g., seq_len ≤ 256) define the valid range for each compiled kernel
+- Recompile only when guard is violated; cache grows over time for different ranges
+- dynamic=True from start avoids the first recompile, but disables CUDA Graphs
+- Prefer torch._dynamo.mark_dynamic() on just the varying dims
+
+- Symbolic = compiler keeps dimensions as variables (S), not constants → one kernel handles any size in range
+- SymPy does algebra through optimization passes so S stays symbolic (e.g., ceil(S/32) not ceil(73/32)=3)
+- At launch time, S is just a kernel argument — no recompilation needed
+
+
+

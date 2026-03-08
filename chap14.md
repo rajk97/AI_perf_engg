@@ -595,4 +595,69 @@ Flow:  @triton.jit kernel
             │
        torch.compile ──► can now fuse/reorder/inline the Triton kernel
 
-"TOP-W: Triton_Op registers the Path, Wrap_triton opens the gate" — two steps to make Triton visible to the compiler.       
+"TOP-W: Triton_Op registers the Path, Wrap_triton opens the gate" — two steps to make Triton visible to the compiler.     
+
+3/8/26: 
+Start at 643
+
+Triton kernel tuning, autotuning, and advanced implementations
+
+- If Triton can't do what you need → fall back to CUDA C++ (e.g., CUTLASS), register as PyTorch extension with autograd
+
+- Kernel launch parameters
+  - Default: 4 warps (128 threads) per block
+  - Modern GPUs (larger shared mem, register files): push to 8 warps (BLOCK_SIZE >= 2048) or 16 warps (BLOCK_SIZE >= 4096)
+  - Compute-heavy kernels → more warps helps (higher occupancy)
+  - Memory-bound kernels → more warps hides latency, but too many → contention/cache thrashing
+  - Manual tuning is tedious → use the autotuner
+
+- Triton autotuner (`@triton.autotune`)
+  - Decorate kernel with a list of `triton.Config` objects (BLOCK_SIZE, num_warps, num_stages, tile size)
+  - First invocation: JIT-compiles and benchmarks every config → caches the fastest one
+  - Subsequent calls with same input shape → reuse cached config (zero tuning cost)
+  - New input shape → re-tunes, caches separately
+  - Warm up with realistic/production inputs to get optimal configs
+  - Custom `key_fn` for advanced per-shape cache control
+
+- The occupancy trade-off
+  - Larger tiles + more warps → higher arithmetic intensity, fewer blocks per SM (less occupancy)
+  - Smaller tiles + fewer warps → more concurrent blocks per SM, less data reuse
+  - Autotuner finds the sweet spot automatically
+
+- Warp specialization in Triton
+  - Split warps into producer (memory) and consumer (compute) roles
+  - Producer prefetches next tile via TMA while consumer computes current tile
+  - Enable with `tl.range(..., warp_specialize=True)` + `num_stages > 1`
+  - Or via autotune config: `num_consumer_groups=2`, `num_buffers_warp_spec=3`
+  - Especially effective for large-K GEMMs — keeps memory subsystem and ALUs busy simultaneously
+  - TorchInductor can emit warp-specialized Triton code automatically for its generated kernels
+
+Autotuner flow
+
+  First call with shape [M, N, K]
+      │
+      ▼
+  Benchmark Config 1: BLOCK=128, warps=4, stages=1  → 1.2 ms
+  Benchmark Config 2: BLOCK=256, warps=8, stages=2  → 0.8 ms  ← winner
+  Benchmark Config 3: BLOCK=512, warps=16, stages=3 → 0.9 ms
+      │
+      ▼
+  Cache: shape [M,N,K] → Config 2
+
+  Subsequent calls with same shape → Config 2 reused instantly
+  New shape [M2, N2, K2] → re-benchmark all configs → cache new winner
+
+Warp specialization overlap
+
+  Without warp specialization:
+    warp 0-7:  load tile 0 ──── compute tile 0 ──── load tile 1 ──── compute tile 1
+                idle                                  idle
+
+  With warp specialization:
+    producer warps:  load tile 1 ──── load tile 2 ──── load tile 3 ────
+    consumer warps:       compute tile 0 ──── compute tile 1 ──── compute tile 2
+                     ▲
+                     └── memory and compute fully overlapped
+
+                     
+  

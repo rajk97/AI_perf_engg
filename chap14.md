@@ -526,3 +526,73 @@ Debugging Compiler Phases, Graph Breaks, and Performance
     - Perfetto UI → trace timeline visualization (low overhead, usable in production)
 
   Tip: start with just "graph_breaks" — output gets very verbose quickly
+
+Writing Custom Kernels with OpenAI Triton
+
+- Triton = Python-native DSL for writing GPU kernels + JIT compiler that compiles to PTX (no CUDA C++ needed)
+- TorchInductor uses Triton as its backend codegen — understanding Triton lets you inspect/customize what Inductor generates
+- Custom Triton kernels can beat Inductor-generated code with domain-specific knowledge (complex sparsity, novel layers)
+- Tradeoff: custom kernels require ongoing maintenance + potential rewrites for new hardware
+- NVIDIA competing with Python-centric alternatives (cuTile, CuTe Python, CUTLASS Python) — but Inductor still uses Triton as primary path
+- Use torch.compile first; write custom Triton only when Inductor can't produce optimal code for your specific pattern
+
+Triton Programming Model:
+
+  Triton kernel code                      What actually happens
+  ─────────────────                       ─────────────────────
+  pid = tl.program_id(0)                  → "which block am I?"
+  offsets = pid * BLOCK + tl.arange(0,BLOCK)  → "my chunk of data"
+  x = tl.load(x_ptr + offsets, mask=mask) → load entire chunk at once
+  result = x + y                          → operate on entire chunk
+  tl.store(out_ptr + offsets, result)     → store entire chunk
+
+  You wrote: 0 threads, 0 warps, 0 shared memory, 0 barriers
+  Triton handles all of that under the hood
+
+- @triton.jit decorator = define a Triton kernel (Python function → GPU code)
+- tl.program_id(axis) = block index (like CUDA blockIdx.x)
+- tl.arange(0, BLOCK_SIZE) = vectorized range for the whole block (not one thread's element)
+- tl.load/tl.store with mask = guarded vectorized memory access (handles out-of-bounds)
+- BLOCK_SIZE: tl.constexpr = compile-time constant (how many elements per program)
+- One Triton program = one CUDA thread block (CTA) — threads/warps inside are invisible
+- No guaranteed one-element-to-one-thread mapping — Triton compiler decides thread layout
+
+## Triton Launch, Shared Memory & PyTorch Registration (pp. 640-642)
+
+### Launching Triton Kernels
+- grid function returns tuple of #program instances: triton.cdiv(n_elements, BLOCK_SIZE)
+- Launched as: kernel[grid](args..., BLOCK_SIZE=1024)
+- num_warps controls threads per CUDA block — NOT the same as BLOCK_SIZE
+- mask = offsets < n_elements prevents OOB access (Triton's version of CUDA's if(idx<N))
+
+### Under the Hood
+- Each Triton "program" → one CUDA thread block
+- tl.arange → per-lane indices; compiler maps vectorized index space across threads
+- Triton auto-coalesces memory, auto-vectorizes arithmetic — you write tile-level, it handles thread-level
+
+### Accessing Shared Memory in Triton
+- No explicit shared-memory allocator (unlike CUDA's __shared__)
+- Instead: tl.make_tensor_descriptor(...) stages tiles into shared memory
+- Pipelined via tl.range(..., num_stages=...) → lowers to cp.async + TMA + barriers
+- Pattern: load tile from A & B into SMEM → reuse for many computes → reduce HBM traffic
+
+### Registering Custom Triton Kernels with PyTorch
+- Problem: raw Triton kernels are opaque to torch.compile → causes graph breaks
+- Solution: @triton_op("lib::op_name", mutates_args=()) registers kernel as a PyTorch op
+- wrap_triton(kernel) makes it inlineable/fuseable within the torch.compile graph
+- Call via: torch.ops.my_triton_lib.vector_add(a, b)
+
+### Training Support (Autograd)
+- Forward-only: just @triton_op is enough
+- For training: register backward via vector_add.register_autograd(backward, setup_context=...)
+- Alternative: torch.autograd.Function (but register_autograd preferred for torch.compile)
+
+Flow:  @triton.jit kernel
+            │
+       @triton_op ──► registers name + mutation metadata with PyTorch
+            │
+       wrap_triton ──► makes kernel visible to torch.compile graph
+            │
+       torch.compile ──► can now fuse/reorder/inline the Triton kernel
+
+"TOP-W: Triton_Op registers the Path, Wrap_triton opens the gate" — two steps to make Triton visible to the compiler.       

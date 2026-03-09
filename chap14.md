@@ -659,5 +659,193 @@ Warp specialization overlap
                      ▲
                      └── memory and compute fully overlapped
 
+3/9/26: 
+
+Software pipelining in Triton
+
+  Pattern: prefetch-next → compute-current → swap
+
+  num_stages=2 (double buffer):
+    ┌──────────┐┌──────────┐┌──────────┐
+    │ load T1  ││ load T2  ││  idle    │
+    │compute T0││compute T1││compute T2│
+    └──────────┘└──────────┘└──────────┘
+    2 buffers in shared memory
+
+  num_stages=3 (triple buffer):
+    ┌──────────┐┌──────────┐┌──────────┐┌──────────┐
+    │ load T2  ││ load T3  ││ load T4  ││  idle    │
+    │ load T1  ││ load T2  ││ load T3  ││  idle    │
+    │compute T0││compute T1││compute T2││compute T3│
+    └──────────┘└──────────┘└──────────┘└──────────┘
+    3 buffers — hides more latency, costs more shared memory
+
+  - Don't overwrite current tile reference before compute finishes — compiler may reorder and break overlap
+  - More stages = diminishing returns if compute-bound or shared memory is tight
+
+Triton Proton profiler
+
+  - Separate profiling package for Triton kernels
+  - Emits NVTX ranges → visible in Nsight Systems timelines
+  - Usage: proton.start("name", hook="triton") → with proton.scope("name", metadata) → finalize
+  - Outputs hierarchical timing table with derived metrics (TFLOPS, bandwidth)
+  - Supply metadata (FLOPS count) → shows how close you are to hardware peak
+  - Workflow: Proton summary → pinpoint kernel → Nsight Systems timeline → Nsight Compute deep dive
+  - Note: for many shapes/precisions, cuBLASLt/CUTLASS may match or beat custom Triton kernels
+
+PyTorch XLA backend
+
+  - Alternative to TorchInductor — targets TPUs (Google), MTIA (Meta), Inferentia/Trainium (AWS)
+  - Activate: torch.compile(..., backend="openxla")
+  - Captures whole-program static graph ahead of time (not incremental like Inductor)
+  - Optimized for static shapes — new shapes trigger full whole-graph recompilation (expensive)
+  - Fix: pad inputs or use fixed-size buckets to avoid recompilation
+  - Caches compiled graphs per shape signature — improves after warm-up
+  - Same principles apply: minimize graph breaks, use distributed strategies (DP, MP)
+  - Not commonly used with NVIDIA GPUs — use TorchInductor for those
+
+  TorchInductor vs XLA
+
+  Feature               TorchInductor             XLA
+  ────────────────────  ────────────────────────  ─────────────────────────
+  Target HW             NVIDIA/AMD GPUs, CPU      TPUs, MTIA, Inferentia
+  Dynamic shapes        symbolic (incremental)    recompile per new shape
+  Compilation style     incremental mid-run       whole-graph ahead of time
+  Kernel codegen        Triton / C++              XLA HLO → device runtime
+  Default for NVIDIA    yes                       no    
+
+PyTorch XLA backend
+
+  - Alternative to TorchInductor — targets TPUs (Google), MTIA (Meta), Inferentia/Trainium (AWS)
+  - Activate: torch.compile(..., backend="openxla")
+  - Captures whole-program static graph ahead of time (not incremental like Inductor)
+  - Optimized for static shapes — new shapes trigger full whole-graph recompilation (expensive)
+  - Fix: pad inputs or use fixed-size buckets to avoid recompilation
+  - Caches compiled graphs per shape signature — improves after warm-up
+  - Same principles apply: minimize graph breaks, use distributed strategies (DP, MP)
+  - Not commonly used with NVIDIA GPUs — use TorchInductor for those
+
+it said the xla will trigger whole program compilation for dynamic shape. how is that different from the torch inductor also triggering recompilation?
+
+TorchInductor vs XLA
+
+Feature               TorchInductor             XLA
+────────────────────  ────────────────────────  ─────────────────────────
+Target HW             NVIDIA/AMD GPUs, CPU      TPUs, MTIA, Inferentia
+Dynamic shapes        symbolic (incremental)    recompile per new shape
+Compilation style     incremental mid-run       whole-graph ahead of time
+Kernel codegen        Triton / C++              XLA HLO → device runtime
+Default for NVIDIA    yes                       no
+
+Chapter 14 — key takeaways
+
+- torch.compile mode selection
+  - "default" for quick startup, "max-autotune" for max performance
+  - Always do warm-up iterations before measuring
+  - Short jobs / small models: compile overhead may not pay off
+
+- Set performance flags early (before any computation)
+  - torch.set_float32_matmul_precision("high") → TF32 fast path
+  - torch.backends.cuda.matmul.allow_tf32 = True
+  - torch.backends.cudnn.allow_tf32 = True
+  - enable_flash_sdp(True), enable_mem_efficient_sdp(True)
+
+- Minimize graph breaks
+  - Inspect: torch._dynamo.explain() or TORCH_LOGS="graph_breaks"
+  - Fix: remove prints, refactor Python if → torch.cond / torch.where
+  - Move non-critical Python processing out of forward()
+  - Goal: long, purely tensor-in tensor-out code path
+
+- Dynamic shapes
+  - dynamic=True forces all dims symbolic upfront — one compiled model handles many shapes
+  - mark_dynamic(tensor, dim) for selective dims only
+  - Trade-off: disables CUDA Graphs, adds extra guards
+  - Hybrid: bucket inputs by size + dynamic=True for remaining variability
+
+- Profile for recompilation guards
+  - TORCH_LOGS="graph_breaks,guards,recompiles" → find which guard triggers
+  - Common culprits: Python random values, changing tensor rank, mixed device/dtype
+
+- Avoid recompilations
+  - Well-tuned loop = zero recompiles after first few iterations
+  - Continued recompiling = something changes every iteration (debug prints, counters, mixed CPU/GPU tensors)
+  - Use set_stance() + guard logging to catch
+
+- Tune memory usage
+  - Compiled mode can use more memory (larger fused kernels, guard buffers)
+  - OOM fixes: smaller BLOCK_SIZE, disable certain fusions, compile submodules separately
+  - Free large intermediates promptly — they persist longer in compiled graph lifecycle
+
+- Combine with distributed training
+  - DDP/FSDP have intentional graph breaks at communication points — these are expected
+  - FSDP + torch.compile: wrap submodules for shard-wise compilation
+  - Graph breaks for gradient pre/post-reduction are handled — focus on forward/backward being compiled
+
+- TORCH_LOGS="perf_hints" for missed optimizations
+  - Tells you if CUDA Graphs weren't used (e.g., input mutation), or if an op fell back to eager
+  - Often suggests the workaround directly
+
+- Debug with small inputs first
+  - Small tensors → fast correctness checks → then scale up
+  - TORCH_LOGS="output_code" to inspect generated kernels on small cases
+
+- Custom kernels only for true bottlenecks
+  - Profile first — TorchInductor already fuses most things
+  - Custom Triton only where Inductor falls short (atypical fusion, custom activation)
+  - Weigh maintenance cost: custom kernels need updates on hardware changes
+  - Consider filing issues for Inductor to support the pattern natively
+
+Chapter 14 — key takeaways (continued)
+
+- Triton best practices
+  - Coalesced memory accesses, avoid shared memory bank conflicts (pad if needed)
+  - Mask tl.load() / tl.store() at boundaries
+  - Block/tile sizes = multiples of 32 (warp-aligned)
+  - Tile sizes that fit L1/shared memory carve-out
+  - Start with num_warps ∈ {4, 8}, num_stages ∈ {2, 3, 4}, then autotune
+  - Check existing community implementations (FlashAttention, etc.) before writing from scratch
+
+- Cache hint caution
+  - Some PTX load hints (non-coherent, L1 no-allocate, 256B L2 prefetch) are undocumented
+  - Can break across driver versions and GPU generations
+  - Prefer Triton's portable knobs: eviction_policy="evict_last", cache_modifier=
+  - Profile when migrating to different CUDA drivers or hardware
+  - Conflicting cache hints are extremely hard to debug
+
+- Stay up to date
+  - Each PyTorch/Triton release: more operator support, fewer graph breaks, free speedups
+  - Especially important as GPU hardware evolves rapidly
+
+- Conclusion
+  - Use profilers together: Nsight Systems + Nsight Compute + PyTorch profiler + Triton Proton
+  - Iterative tuning: fix one bottleneck → next one emerges (GPU kernel → CPU overhead → input pipeline)
+  - Compiler handles a big piece, but also optimize data loading, I/O, and algorithmic choices
+
+Chapter 14 — full pipeline recap
+
+  Python model
+      │
+      ▼
+  TorchDynamo ─── FX Graph (captures tensor ops, PEP 523)
+      │
+      ▼
+  AOT Autograd ── joint fwd+bwd graph (cross-pass fusion)
+      │
+      ▼
+  PrimTorch IR ── 2000+ ops → 250 primitives (no in-place mutations)
+      │
+      ▼
+  TorchInductor ─ loop-level IR → fused kernels
+      │
+      ├──► Triton → LLVM NVPTX → PTX (GPU)
+      ├──► C++/OpenMP (CPU)
+      └──► Halide (alternative)
+               │
+               ▼
+          (optional) CUDA Graph capture for replay
+
+  Alternative path: torch.export() → AOTInductor → deploy .so artifact
+  Alternative backend: XLA → TPUs, MTIA, Inferentia
+
                      
   

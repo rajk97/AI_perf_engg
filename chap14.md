@@ -847,5 +847,6 @@ Chapter 14 — full pipeline recap
   Alternative path: torch.export() → AOTInductor → deploy .so artifact
   Alternative backend: XLA → TPUs, MTIA, Inferentia
 
-                     
+
+
   

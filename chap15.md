@@ -391,3 +391,143 @@ Two separate phases
   - Extrapolates target model's own intermediate representations
   - Higher acceptance rates → up to 3.5x speedup with 4-token draft
   - Preserves target model's output distribution
+
+3/18/26:
+
+EAGLE evolution
+
+  EAGLE-1: draft model predicts internal feature vectors → decode to tokens (up to 3.5x)
+  EAGLE-2: adds dynamic draft TREE of possibilities → 20-40% faster than EAGLE-1
+  EAGLE-3: skips feature prediction, predicts tokens directly using fused multi-layer features
+           → up to 1.4x over EAGLE-2, up to 6.5x over vanilla baseline
+
+- Other tricks: skip every Nth layer, FP8/NVFP4 for draft, smaller hidden size during draft
+
+Self-speculative decoding (single model, no draft model)
+
+- Same target model does both draft and verify
+- Draft pass: skip half the layers (or lower precision) → fast approximate output of k tokens
+- Verify pass: full forward pass on all k tokens → accept/reject left-to-right
+- No separate model to train/maintain/deploy
+- ~2x speedup, similar to two-model speculative decoding  
+
+Medusa:
+
+Standard LLM: 1 head → 1 token per forward pass
+
+  Input: "The cat sat on the"
+                │
+                ▼
+  ┌──────────────────────┐
+  │   Transformer body    │
+  │   (all layers)        │
+  └──────────┬───────────┘
+             │
+         [head 0]  → "warm"         ← 1 token per step
+             │
+  Next step: "The cat sat on the warm"
+             → another full forward pass for "sunny"
+             → another for "roof"
+             → 3 forward passes for 3 tokens
+
+
+Medusa LLM: multiple heads → multiple tokens per forward pass
+
+  Input: "The cat sat on the"
+                │
+                ▼
+  ┌──────────────────────┐
+  │   Transformer body    │
+  │   (all layers)        │    same body, shared computation
+  └──┬───────┬───────┬───┘
+     │       │       │
+  [head 0] [head 1] [head 2]     ← extra heads added during training
+     │       │       │
+   "warm"  "sunny"  "roof"        ← 3 tokens from 1 forward pass!
+
+How the tree-based verification works
+
+  Medusa generates a TREE of candidates, not a single sequence:
+
+                      "warm"   (head 0: next token)
+                     /      \
+               "sunny"      "cozy"    (head 1: token+2 candidates)
+              /     \       /    \
+          "roof" "deck" "little" "big"  (head 2: token+3 candidates)
+
+  This gives multiple candidate PATHS through the tree:
+    Path A: warm → sunny → roof
+    Path B: warm → sunny → deck
+    Path C: warm → cozy → little
+    Path D: warm → cozy → big
+
+  Verification: tree-based attention checks all paths in ONE forward pass
+    Target agrees with: warm ✓ → sunny ✓ → roof ✓  (Path A wins!)
+    Accept 3 tokens from 1 forward pass
+
+  If Path A fails at "roof":
+    warm ✓ → sunny ✓ → roof ✖ but deck ✓ → accept warm, sunny, deck
+    The TREE gives fallback options that a single chain wouldn't have
+
+Why tree > chain
+
+  Single chain (speculative decoding):
+    warm → sunny → roof → top
+    If "roof" wrong → discard "roof" and "top" → only 2 tokens accepted
+
+  Tree (Medusa):
+    warm → sunny → roof
+                 → deck    ← backup branch!
+         → cozy → little
+                → big
+    If "roof" wrong → try "deck" → if correct → still 3 tokens accepted
+    More branches = more chances to match = higher acceptance rate
+
+        Speculative decoding comparison
+
+  Method                Model(s)    Tokens/pass   Speedup    Trade-off
+  ────────────────────  ──────────  ────────────  ─────────  ─────────────────
+  Two-model spec        draft+target  1 (draft)   1.5-2.5x   deploy 2 models
+  EAGLE-1               draft head    1 (feature)  ~3.5x     feature prediction
+  EAGLE-3               draft head    1 (direct)   ~6.5x     fused multi-layer
+  Self-speculative      target only   1 (skip layers) ~2x    no extra model
+  Medusa                1 model+heads MULTIPLE      2-3.6x   must retrain model
+
+Interleaving decode steps across requests
+
+- Inference engine batches token-level decode steps from different users on same GPU
+- While one request waits on I/O or dependency → GPU runs another request's next token
+- Doesn't speed up single-request latency (may add tiny overhead)
+- Greatly improves throughput + GPU utilization under heavy concurrent load
+- Implemented via continuous batching + token scheduling in vLLM, SGLang, etc.
+- Verify with Nsight Systems that token-step kernels overlap with NIC/NVLink transfers
+
+Constrained decoding (structured outputs)
+
+- Force output to match a format (JSON schema, grammar, allowed tokens)
+- At each step, only valid tokens allowed → scan down vocabulary until valid one found
+- Cost: few ms per token for grammar checking + vocabulary filtering
+
+- Mitigation: compile grammar → precompute valid token masks per state
+  - Mask invalid softmax outputs at runtime → reduces backtracking
+  - Simple JSON schemas: low single-digit % overhead
+  - Complex grammars / small batches: can hit double-digit % overhead
+
+- Implementations: TensorRT-LLM (XGrammar backend), vLLM, Hugging Face Transformers
+- Best practice: keep grammars compact, avoid overly restrictive constraints
+- Alternative: let LLM decode freely → postprocess/filter outputs (not always viable)
+
+MoE dynamic routing and expert communication
+
+- Every MoE layer: all-to-all shuffle sends tokens to GPUs hosting their assigned experts
+- Happens per layer → can dominate inference time if not optimized
+
+- Hierarchical routing to reduce cross-node traffic:
+
+  Step 1: route within node (NVLink/NVSwitch — fast)
+    GPU 0 ←→ GPU 1 ←→ GPU 2 ←→ GPU 3    (intra-node, ~1.8 TB/s)
+
+  Step 2: route across nodes only for tokens needing non-local experts
+    Node 0 ←→ Node 1    (inter-node, InfiniBand — slower)
+
+  Two-stage all-to-all: most tokens stay local, only stragglers cross the node boundary

@@ -801,3 +801,40 @@ Dynamic routing — summary and operational notes
   - Log all dynamic changes (replica spawns, gating bias adjustments, expert reassignments)
   - Alert when any expert utilization exceeds threshold (e.g. 80%)
   - Continuous profiling + adaptive algorithms to keep GPUs computing, not idling
+
+Key takeaways
+
+- Disaggregate prefill and decode onto separate GPU pools
+  - Eliminates interference → low TTFT + high tokens/sec simultaneously
+  - Foundational technique for large-scale LLM serving
+
+- Use hybrid parallelism (TP + PP + EP + DP + CP) for massive models
+  - No single strategy is sufficient for multi-trillion-parameter models
+  - Optimal mix is hardware-dependent → always profile and tune
+
+- Speculative decoding accelerates generation without retraining
+  - Two-model: ~2-3x speedup
+  - EAGLE-2: up to 3.5x (20-40% over EAGLE-1)
+  - Medusa: up to 3.6x (requires retraining heads)
+  - Quality-preserving — output distribution unchanged under standard verification
+
+- Constrained decoding for structured outputs
+  - Compiled grammars + optimized masks → low single-digit % overhead at scale
+  - Complex grammars / small batches → higher overhead
+  - Avoid overly strict rules that cause excessive backtracking
+
+- Balance MoE workloads for near-linear scaling
+  - Hierarchical all-to-all, capacity limits, top-2 gating, hot expert replication
+  - Well-tuned MoE → near-linear throughput scaling with added GPUs
+
+- Hardware-software codesign
+  - Inference engines (vLLM, SGLang, NVIDIA Dynamo) orchestrate multi-GPU/multinode
+  - Keep intra-node on NVSwitch, InfiniBand only when necessary
+  - Overlap communication with computation
+
+- Complexity vs ROI
+  - Each optimization adds system complexity → weigh cost vs benefit
+  - Start with biggest bottleneck (prefill/decode interference)
+  - Add complexity incrementally, profile at each step
+  - Interactive apps: 2-3x latency gain usually worth it
+  - Simpler use cases: straightforward approach may suffice

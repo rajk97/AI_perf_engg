@@ -725,3 +725,79 @@ HOW THEY ALL FIT TOGETHER:
                          │                         │
                          ▼                         │
                    Continue to next layer
+
+Load balancing, capacity factor, and expert replication
+
+- Problem: router may send disproportionate tokens to a few hot experts
+  - Hot GPU at 99% while others sit at 60% → bottlenecks the entire cluster
+
+- Training-time fix: load-balancing loss
+  - Extra loss term penalizes gate for overusing some experts / underusing others
+  - Result: trained model distributes tokens more evenly
+
+- Inference-time fix 1: capacity factor
+  - Each expert has a max token cap (e.g. capacity factor 1.2 = 120% of average load)
+  - Overflow tokens → forwarded to next-best expert (by routing score) or serialized in a second pass
+  - Common config: capacity factor 1.2 with top-2 gating
+
+  Expert 3 capacity = 32 tokens, receives 40:
+    first 32 → processed by Expert 3
+    remaining 8 → rerouted to Expert with next-highest score
+
+- Inference-time fix 2: expert replication
+  - Clone hot expert onto another GPU → router can split tokens across original + clone
+  - Replicas are transparent to the model — engine registers them as separate indices
+  - Only replicate the few hot experts, not all → targeted cost increase
+  - Replicas loaded from same checkpoint, never updated independently (prevents divergence)
+
+  Before:  Expert 5 on GPU 2 only → overloaded
+  After:   Expert 5 on GPU 2 + Expert 5 clone on GPU 6 → load split
+
+Adaptive expert routing and real-time monitoring
+
+- Standard gating: fixed routing scores from training, no runtime awareness
+- Adaptive routing: inference engine intercepts gating softmax, adjusts based on live load
+
+  How it works:
+    1. Each expert GPU emits utilization metrics (Prometheus/Grafana)
+    2. Engine sees GPU 3 at 99%, GPU 7 at 60%
+    3. Engine biases gating scores: lowers Expert 3 weight, raises Expert 7 weight
+    4. Some tokens diverted to less-loaded expert (slightly lower score, but available)
+
+- Profiling: Nsight Systems timeline traces — if one GPU's all-to-all segment is much longer,
+  it is processing more tokens than others → rebalance signal
+
+- Actions the engine can take dynamically:
+  - Adjust gating probabilities (bias scores)
+  - Reassign experts to different GPUs
+  - Spawn additional expert replicas (requires pre-provisioned capacity or fast model loading)
+
+- Tradeoff: adds monitoring overhead, decision logic, configuration complexity
+  - Not always worth it — profile your specific workload to decide
+
+Dynamic routing — summary and operational notes
+
+- Two core objectives of dynamic MoE routing:
+  1. Reduce routing overhead (fast interconnects, overlap comms with compute, co-location)
+  2. Evenly distribute work across expert GPUs (gating, capacity factor, replication)
+
+- Expert placement matters: grouping experts to produce uniform token distribution
+  → GPUs finish each layer more synchronously → better parallelism
+
+- Modern MoE schedulers can spawn additional replicas on the fly if persistent imbalance detected
+
+- Gating options (can combine):
+  - Simple: top-1 or top-2 gating
+  - Advanced: capacity-aware gates, dynamic replication, expert reassignment
+
+- Scaling: with balanced load + minimal routing overhead → near-linear throughput scaling
+  - Doubling GPUs can nearly double inference throughput
+
+- Advanced optimizations:
+  - Bypass / turn off underutilized experts entirely
+  - Cache expert outputs → skip redundant compute for repeated token patterns
+
+- Operational best practices:
+  - Log all dynamic changes (replica spawns, gating bias adjustments, expert reassignments)
+  - Alert when any expert utilization exceeds threshold (e.g. 80%)
+  - Continuous profiling + adaptive algorithms to keep GPUs computing, not idling

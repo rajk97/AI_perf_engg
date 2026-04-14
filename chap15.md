@@ -531,3 +531,197 @@ MoE dynamic routing and expert communication
     Node 0 ←→ Node 1    (inter-node, InfiniBand — slower)
 
   Two-stage all-to-all: most tokens stay local, only stragglers cross the node boundary
+
+4/14/26:
+
+MoE (Mixture of Experts) — how it works
+
+- Dense model: every token passes through ONE large FFN per layer
+- MoE model: replace that one FFN with N smaller expert FFNs + a router
+- Router = small linear layer that scores each expert per token → softmax → top-k gating
+- Only top-k experts (usually 2) activate per token → rest stay idle
+- Output = weighted sum of active experts' outputs (weights from router softmax)
+
+  Dense:    token → [FFN] → output
+
+  MoE:      token → [Router] → picks Expert 2 (weight 0.6) + Expert 5 (weight 0.4)
+                         │
+                         ├→ Expert 2: token × 0.6
+                         └→ Expert 5: token × 0.4
+                                  │
+                                  ▼
+                          weighted sum → output
+
+- Benefit: model has N experts worth of parameters but only runs k per token → more capacity, same compute
+- Used in: Mixtral, DeepSeek, GPT-4 (rumored), Switch Transformer
+
+MoE with expert parallelism — tokens must travel
+
+- Each GPU hosts DIFFERENT experts (Expert 0 on GPU 0, Expert 1 on GPU 1, etc.)
+- Each GPU also has a local batch of tokens from the scheduler
+- Router runs locally → tells each token which expert (= which GPU) to visit
+- Problem: tokens must physically move to the GPU hosting their assigned expert
+
+  Per MoE layer, two all-to-all communications happen:
+
+  ALL-TO-ALL #1 (dispatch): send each token to the GPU hosting its expert
+  → each GPU runs its local expert on all tokens that arrived
+  ALL-TO-ALL #2 (combine): send results BACK to origin GPU
+
+  Why send back? The next layer (attention, layernorm) needs ALL tokens together again
+  MoE is a temporary detour: together → scatter → compute → gather → together
+
+  GPU 0 owns [A,B,C,D] for the entire forward pass
+       │
+       │ attention, norms (all local)
+       ▼
+    ┌─ MoE layer ──────────────────────────────┐
+    │ Router: A→Expert2, B→Expert0, C→Expert3  │
+    │ ALL-TO-ALL #1: ship A to GPU2, C to GPU3 │
+    │ COMPUTE: each GPU runs its expert         │
+    │ ALL-TO-ALL #2: results back to origin     │
+    └──────────────────────────────────────────┘
+       │
+       ▼ attention, norms continue (all local)
+
+┌─────────────────────────────────────────────────────────────────┐
+│            MoE COMMUNICATION OPTIMIZATION — BIG PICTURE         │
+│                                                                 │
+│  Problem: all-to-all is the BOTTLENECK of MoE layers            │
+│  Goal:    minimize time tokens spend in transit, maximize GPU    │
+│           compute utilization                                    │
+└─────────────────────────────────────────────────────────────────┘
+
+There are 5 independent levers. Each attacks a different angle:
+
+  ┌──────────────────────────────────────────────────────────────┐
+  │  LEVER 1: OVERLAP (hide latency)                             │
+  │  ─────────────────────────────                               │
+  │  Double-buffer: send batch N+1 while computing batch N       │
+  │                                                              │
+  │  Time: ──[send B1][send B2][send B3]──                       │
+  │         ─────────[comp B1][comp B2]──   ← overlap            │
+  └──────────────────────────────────────────────────────────────┘
+
+  ┌──────────────────────────────────────────────────────────────┐
+  │  LEVER 2: SCHEDULE (avoid global barrier)                    │
+  │  ────────────────────────────────────                        │
+  │  Butterfly / shifted schedule: phased partial exchanges      │
+  │                                                              │
+  │  Naive:      everyone → BARRIER → go         (1 big sync)   │
+  │  Butterfly:  round1(partial) → round2(partial) → done       │
+  │              every link busy every round, no idle waiting    │
+  └──────────────────────────────────────────────────────────────┘
+
+  ┌──────────────────────────────────────────────────────────────┐
+  │  LEVER 3: HIERARCHY (use fast links first)                   │
+  │  ────────────────────────────────────────                    │
+  │  Stage 1: intra-rack shuffle via NVLink (fast, 130 TB/s)    │
+  │  Stage 2: inter-rack only for RESIDUAL tokens (slow NIC)    │
+  │                                                              │
+  │  ┌─Rack A──────┐     ┌─Rack B──────┐                        │
+  │  │ GPU↔GPU     │ ──→ │ GPU↔GPU     │                        │
+  │  │ NVLink ⚡    │ NIC │ NVLink ⚡    │                        │
+  │  │ (most done  │ 🐌  │ (most done  │                        │
+  │  │  here)      │     │  here)      │                        │
+  │  └─────────────┘     └─────────────┘                        │
+  └──────────────────────────────────────────────────────────────┘
+
+  ┌──────────────────────────────────────────────────────────────┐
+  │  LEVER 4: PLACEMENT (avoid sending at all)                   │
+  │  ─────────────────────────────────────                       │
+  │  Expert collocation: put commonly co-activated experts       │
+  │  on the SAME GPU                                             │
+  │                                                              │
+  │  Profile shows: Expert 5 and Expert 7 fire together 80%     │
+  │                                                              │
+  │  Before: token → GPU 2 (Expert 5) → GPU 4 (Expert 7)        │
+  │          = 2 network hops                                    │
+  │                                                              │
+  │  After:  token → GPU 2 (Expert 5 + Expert 7)                │
+  │          = 0 extra hops, both run locally                    │
+  │                                                              │
+  │  How to find pairs: gating-frequency analysis (profile which │
+  │  experts the router picks together)                          │
+  └──────────────────────────────────────────────────────────────┘
+
+  ┌──────────────────────────────────────────────────────────────┐
+  │  LEVER 5: COMPRESSION (send fewer bytes)                     │
+  │  ───────────────────────────────────────                     │
+  │  Cast activations to FP8 or NVFP4 before sending            │
+  │                                                              │
+  │  FP16 activation: 2 bytes per value                          │
+  │  FP8  activation: 1 byte per value  → 2x less traffic       │
+  │  NVFP4 activation: 0.5 bytes        → 4x less traffic       │
+  │                                                              │
+  │  Tradeoff: tiny precision loss, but network is the           │
+  │  bottleneck so pack/unpack cost is negligible                │
+  │                                                              │
+  │  Done via NVIDIA Transformer Engine on Tensor Cores          │
+  └──────────────────────────────────────────────────────────────┘
+
+
+INFRASTRUCTURE CHECKLIST (making the hardware ready for MoE):
+─────────────────────────────────────────────────────────────
+  ┌─────────────────────────┬────────────────────────────────┐
+  │ What                    │ Why                            │
+  ├─────────────────────────┼────────────────────────────────┤
+  │ NVLink Switch mesh      │ Full bandwidth intra-rack      │
+  │ (e.g. NVL72)            │ all-to-all (up to 72 GPUs)    │
+  ├─────────────────────────┼────────────────────────────────┤
+  │ GPUDirect RDMA enabled  │ GPU→NIC→GPU without CPU copy  │
+  │ on internode paths      │ for cross-rack transfers       │
+  ├─────────────────────────┼────────────────────────────────┤
+  │ InfiniBand link bonding │ Multiple physical ports → one  │
+  │                         │ fat logical pipe + failover    │
+  ├─────────────────────────┼────────────────────────────────┤
+  │ NCCL algorithm choice   │ ncclAllToAll vs grouped        │
+  │                         │ send/recv — profile both!      │
+  ├─────────────────────────┼────────────────────────────────┤
+  │ Profile link utilization│ Check BOTH NVLink AND NIC      │
+  │                         │ paths are saturated            │
+  └─────────────────────────┴────────────────────────────────┘
+
+
+HOW THEY ALL FIT TOGETHER:
+──────────────────────────
+  Token arrives at MoE layer
+         │
+         ▼
+  Router assigns expert ──→ Is expert LOCAL?
+         │                      │
+         │ YES                  │ NO
+         ▼                      ▼
+    Just compute         ┌─ COMPRESS (FP8/NVFP4) ─┐
+                         │                         │
+                         ▼                         │
+                  Expert on same rack?             │
+                    │          │                    │
+                   YES         NO                  │
+                    │          │                    │
+                    ▼          ▼                    │
+               NVLink      NVLink first            │
+               shuffle     then NIC for            │
+               (fast)      residual (HIERARCHY)    │
+                    │          │                    │
+                    ▼          ▼                    │
+                  ┌─ BUTTERFLY SCHEDULE ─┐         │
+                  │  (phased rounds,     │         │
+                  │   no global barrier) │         │
+                  └──────────────────────┘         │
+                         │                         │
+                         ▼                         │
+                  ┌─ DOUBLE-BUFFER ──────┐         │
+                  │  overlap with prev   │         │
+                  │  batch's compute     │         │
+                  └──────────────────────┘         │
+                         │                         │
+                         ▼                         │
+                   Expert computes                 │
+                         │                         │
+                         ▼                         │
+                  DECOMPRESS + send back           │
+                  (another all-to-all)             │
+                         │                         │
+                         ▼                         │
+                   Continue to next layer

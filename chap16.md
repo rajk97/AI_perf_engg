@@ -53,3 +53,47 @@ Capacity planning and scaling decisions
   - Otherwise bottleneck just shifts to network
 - Always weigh cost of new hardware vs efficiency gains
   - Sometimes newer GPUs (more memory, more FLOPS) are cheaper than scaling out old ones
+
+Monitoring system metrics and counters
+
+- LLM requests are nonuniform (variable length, variable compute) unlike traditional microservices
+  - Can't predict latency from request alone → need continuous monitoring
+
+- Stack: Prometheus (scrape + collect) → Grafana (visualize + alert)
+
+- GPU metrics via DCGM (Data Center GPU Manager):
+  - DCGM_FI_DEV_GPU_UTIL: SM utilization %
+  - DCGM_FI_DEV_MEM_COPY_UTIL: memory copy engine utilization
+  - DCGM_FI_DEV_FB_USED: framebuffer memory used
+  - Also: GPU temperature, power (throttling detection), Xid error counters
+  - cudaMemPool metrics for memory fragmentation monitoring
+
+- Low-level counters (L1/L2 activity, occupancy, instruction throughput):
+  - Collected via Nsight Compute or CUPTI, not DCGM
+
+- Interconnect metrics:
+  - NVLink/NVSwitch bandwidth, NIC throughput
+  - DCGM exposes NVLink error counters but per-link bandwidth may require direct DCGM query
+  - Also use nvidia-smi nvlink and Nsight tools for sustained link utilization
+  - Alert on saturation of cross-GPU and cross-node communication
+
+- Application-level metrics to track:
+  - Requests/sec, avg latency, p95/p99 latency
+  - Tokens/sec throughput
+  - Active contexts count
+  - KV cache utilization and size (overall + per node)
+  - Batch size changes (use counters, not log searching)
+
+- Counters > log searching:
+  - Increment Prometheus counter for app-level events (batch size changes, errors, etc.)
+  - Instantly viewable in Grafana alongside GPU metrics in real time
+  - Log-based analysis requires slow offline aggregation (Spark) + manual correlation
+
+- Structured logging + distributed tracing (OpenTelemetry / APM tools):
+  - Correlate logs/traces with metrics → consistent timeline across entire system
+  - Speeds up debugging significantly
+
+- Dynamic batching: inference servers expose "maximum latency" setting
+  - Increasing it → larger batches → higher throughput
+  - Too much → p99 latency exceeds SLO
+  - Continuously tune against latency targets

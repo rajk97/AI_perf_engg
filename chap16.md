@@ -97,3 +97,40 @@ Monitoring system metrics and counters
   - Increasing it → larger batches → higher throughput
   - Too much → p99 latency exceeds SLO
   - Continuously tune against latency targets
+
+You only ever have 3 questions when something is slow:
+
+  1. IS THE GPU BUSY?
+     └→ SM util %  (DCGM)
+
+  2. IS THE GPU FED?
+     └→ Memory BW, cache hit rate, NVLink/NIC throughput
+
+  3. IS THE USER HAPPY?
+     └→ p99 latency, tokens/sec
+
+
+  That's it. Everything else is just WHERE to look:
+
+  ┌─────────────────────┬────────────────────────┐
+  │ Question            │ If answer is NO        │
+  ├─────────────────────┼────────────────────────┤
+  │ GPU busy?           │ Increase batch size    │
+  │                     │ or overlap more        │
+  ├─────────────────────┼────────────────────────┤
+  │ GPU fed?            │ Fix cache misses,      │
+  │                     │ fix interconnect,      │
+  │                     │ fix memory pressure    │
+  ├─────────────────────┼────────────────────────┤
+  │ User happy?         │ Something above broke  │
+  │                     │ OR batch too big (p99) │
+  └─────────────────────┴────────────────────────┘
+
+
+  The tooling is just plumbing:
+
+  DCGM         = "give me GPU numbers"
+  Prometheus   = "store them"
+  Grafana      = "show me pretty graphs"
+  Nsight       = "deep dive when graphs look bad"
+  OpenTelemetry= "trace a single request end to end"  

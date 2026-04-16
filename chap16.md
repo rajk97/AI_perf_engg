@@ -182,3 +182,65 @@ Profiling with Nsight Systems
   - GPU idle gaps between kernels → scheduling or sync issue
   - Prefill/decode overlap with communication → good (overlap working)
   - Long all-to-all blocks with idle SMs → communication bottleneck
+
+- Nsight Compute: two modes
+  - Full instrumentation (default): replays kernel with HW counters, exact counts, slow (5-20x replay)
+  - PC Sampling: periodically snapshots program counter, statistical hotspots, fast + low overhead
+  - Strategy: PC Sampling first on live server → find hotspot → full instrumentation on that one kernel
+
+Inference troubleshooting recipes
+
+- Production: no heavy profilers running continuously
+- Rely on lightweight metric-based monitoring → detect anomaly → hypothesis → fix → verify
+
+  ┌──────────────────────────┬──────────────────────────┬──────────────────────────────────┐
+  │ Symptom                  │ Probable cause           │ Fix                              │
+  ├──────────────────────────┼──────────────────────────┼──────────────────────────────────┤
+  │ SM util < 50%            │ Small batches or         │ Increase batch size, enable      │
+  │                          │ unfused kernels          │ FlashAttention / fused SDPA,     │
+  │                          │                          │ custom Triton kernels            │
+  ├──────────────────────────┼──────────────────────────┼──────────────────────────────────┤
+  │ KV cache preemption      │ Insufficient KV cache    │ Raise GPU mem util threshold,    │
+  │ warnings (vLLM)          │ space                    │ reduce max batched tokens,       │
+  │                          │                          │ use PagedAttention               │
+  ├──────────────────────────┼──────────────────────────┼──────────────────────────────────┤
+  │ p95 > 200ms              │ Decode hotspot or        │ Check router logs, tune prefetch │
+  │                          │ head-of-line blocking    │ threshold, enable spec decoding  │
+  ├──────────────────────────┼──────────────────────────┼──────────────────────────────────┤
+  │ Cache hit rate < 60%     │ Unbalanced shards or     │ Validate prefix cache config     │
+  │                          │ missing prefix cache     │ (LMCache NIXL), increase TTL     │
+  ├──────────────────────────┼──────────────────────────┼──────────────────────────────────┤
+  │ Unexpected OOM           │ Overcommitted GPU mem    │ Lower per-instance mem util,     │
+  │ (multitenant GPU)        │                          │ enable CPU/NVMe offload,         │
+  │                          │                          │ pin to CPU socket                │
+  ├──────────────────────────┼──────────────────────────┼──────────────────────────────────┤
+  │ Irregular perf outliers  │ Mismatched clocks or     │ Sync clocks, monitor thermal/    │
+  │                          │ thermal throttling       │ power throttling                 │
+  └──────────────────────────┴──────────────────────────┴──────────────────────────────────┘
+
+- Log lines to watch for:
+  - vLLM: "preempted by PreemptionMode.RECOMPUTE because not enough KV cache space"
+    → KV recompute triggered, wastes GPU compute, increases latency
+  - NVIDIA Dynamo router: "prefix-cache hit (90%)" = good, local prefill
+    → "cache miss; dispatching remote prefill to GPU-node-03" = miss, remote dispatch
+
+Full-stack inference optimizations
+
+- Every layer of the stack contributes, not just one:
+
+  ┌───────────────────┬──────────────────────────────────────────────┐
+  │ Layer             │ Techniques                                   │
+  ├───────────────────┼──────────────────────────────────────────────┤
+  │ Model             │ Pruning, distillation, sparsity, MoE,       │
+  │                   │ FlashAttention, quantization-aware training  │
+  ├───────────────────┼──────────────────────────────────────────────┤
+  │ Kernel            │ Fused ops, FlashInfer, Tensor Cores,        │
+  │                   │ block tiling, async memory transfers        │
+  ├───────────────────┼──────────────────────────────────────────────┤
+  │ Runtime           │ Dynamic batching, paged KV cache,           │
+  │                   │ CUDA Graphs, compute-comm overlap           │
+  ├───────────────────┼──────────────────────────────────────────────┤
+  │ Orchestration     │ Prefill/decode disaggregation, routing,     │
+  │                   │ multitenancy isolation, autoscaling          │
+  └───────────────────┴──────────────────────────────────────────────┘
+  - Long all-to-all blocks with idle SMs → communication bottleneck

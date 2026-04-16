@@ -134,3 +134,51 @@ You only ever have 3 questions when something is slow:
   Grafana      = "show me pretty graphs"
   Nsight       = "deep dive when graphs look bad"
   OpenTelemetry= "trace a single request end to end"  
+
+Debugging KV cache swapping
+
+- When GPU memory is near max → inference engine swaps KV cache to CPU or NVMe
+- Symptom: high copy-engine util + low SM util at the same time = swapping
+  - Also: abnormal NVLink util that aligns with GPU idle periods
+
+- Fixes:
+  - Tune paging parameters to reduce thrashing
+  - Apply FP8/FP4 quantization (smaller KV cache)
+  - Increase GPU memory allocation for cache
+  - Change swapping strategy
+  - Goal: copy util down, compute util up
+
+Correlating latency spikes
+
+- p99 spike? Overlay RPS (requests/sec) on latency graph in Grafana
+  - If spike correlates with traffic surge → dynamic batch size grew too large
+  - Fix: decrease max request-batch queue delay or cap max batch size
+- Combine log timeline (DEBUG level, enable/disable as needed) with Prometheus metrics
+  - Logs: step-by-step events (batch formed, comm start/end)
+  - Metrics: aggregate view (how often all-to-all >5ms?)
+  - Together: spot outliers like network degradation on one link
+
+- MoE-specific: if all-to-all keeps spiking on one path
+  - Raise capacity factor to 1.2-1.5 → excess tokens spill to secondary expert replica
+  - Prefer replica on GPU with more stable network path
+  - Better to spill than to queue behind a stalled expert
+
+Profiling with Nsight Systems
+
+- Nsight Systems: timeline view of CPU threads + GPU kernels + CUDA events + NCCL comms
+  - Microsecond resolution, shows idle gaps and unexpected synchronizations
+
+- NVTX annotations: label regions on the timeline for clarity
+  - Mark "Prefill", "Decode", "All-to-all" etc. with colored ranges
+  - Use C API (nvtxRangePushEx / nvtxRangePop) for C++ runtimes
+  - Scope tightly: wrap exactly the work, nothing else
+
+- Per-stream NVTX ranges: when using multiple CUDA streams
+  - Name streams: nvtxNameCudaStreamA(stream, "transfer_stream")
+  - Wrap each stream's host code with distinct NVTX ranges
+  - Timeline shows overlap between transfer and compute streams
+
+- Key things to look for in Nsight Systems timeline:
+  - GPU idle gaps between kernels → scheduling or sync issue
+  - Prefill/decode overlap with communication → good (overlap working)
+  - Long all-to-all blocks with idle SMs → communication bottleneck

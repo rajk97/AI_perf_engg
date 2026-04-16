@@ -242,5 +242,59 @@ Full-stack inference optimizations
   ├───────────────────┼──────────────────────────────────────────────┤
   │ Orchestration     │ Prefill/decode disaggregation, routing,     │
   │                   │ multitenancy isolation, autoscaling          │
+  ├───────────────────┼──────────────────────────────────────────────┤
+  │ Deployment        │ Geo-distributed edge serving, smart API     │
+  │                   │ gateway batching, CI/CD for model variants,  │
+  │                   │ NVLink/NVSwitch + IB, NUMA affinity         │
+  ├───────────────────┼──────────────────────────────────────────────┤
+  │ QoS / scaling     │ SLA-aware dynamic batching, MIG/stream      │
+  │                   │ priorities, real-time profiling dashboards,  │
+  │                   │ dynamic parallelism switching (TP/PP/DP)    │
   └───────────────────┴──────────────────────────────────────────────┘
+
+- Cross-layer synergy example:
+  quantization (model) → smaller footprint → larger batch (runtime) → more requests merged (orchestration)
+
+- Profiling-driven focus: after fusion + quantization, if CPU becomes bottleneck
+  → faster tokenizers or offload preprocessing to GPU
+
+- Complexity tradeoff: speculative decoding + Medusa = complex, reserve for extreme cases
+  - Lighter methods (sparsity, batching, disaggregation) deliver bulk of production gains
+
+- Keep stack up to date (CUDA, cuDNN, NCCL) — newer versions include latest optimizations
+
+Debugging correctness issues
+
+- Memory leak detection: if GPU memory climbs over time
+  - Use Compute Sanitizer: compute-sanitizer --tool memcheck your_binary
+  - Catches device memory errors, race conditions, out-of-bounds accesses
+
+- NCCL failures:
+  - Symptom: one GPU near 0% util while others at 90% → GPU dropped out of NCCL group
+  - Check logs for NCCL_COMM_FAILURE warnings
+  - Enable debug: NCCL_DEBUG=WARN (verbose!)
+  - Use NCCL test suite for all-reduce / all-to-all correctness
+  - ncclCommGetAsyncError + ncclCommAbort for async error handling
+  - Fix: reinitialize NCCL communicators or full node reboot (rejoin group after)
+
+- Prometheus alert rules to set up:
+
+  ┌──────────────────────────┬────────────────────┬──────────┐
+  │ Metric                   │ Condition          │ Severity │
+  ├──────────────────────────┼────────────────────┼──────────┤
+  │ GPU util                 │ < 10% for >60s     │ Idle     │
+  │ GPU util                 │ > 90%              │ Bottlenk │
+  │ Memory usage             │ > 80%              │ Warning  │
+  │ Memory usage             │ > 95%              │ Critical │
+  │ Temperature              │ > 85C              │ Warning  │
+  │ Temperature              │ > 95C              │ Critical │
+  │ NVLink replay/recovery   │ >= 1               │ Critical │
+  │ NVLink CRC errors        │ > 100/sec          │ Critical │
+  │ PCIe replay errors       │ >= 1               │ Critical │
+  │ Uncorrectable ECC errors │ >= 1               │ Critical │
+  └──────────────────────────┴────────────────────┴──────────┘
+
+- Hardware dropouts: GPU or NVLink silently disconnects after fatal error
+  - DCGM per-link NVLink metrics: DCGM_FI_DEV_NVLINK_TX/RX_BANDWIDTH_L*
+  - Fallback: nvidia-smi nvlink, Nsight, NVSwitch counters
   - Long all-to-all blocks with idle SMs → communication bottleneck

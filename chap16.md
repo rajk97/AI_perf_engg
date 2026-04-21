@@ -297,4 +297,71 @@ Debugging correctness issues
 - Hardware dropouts: GPU or NVLink silently disconnects after fatal error
   - DCGM per-link NVLink metrics: DCGM_FI_DEV_NVLINK_TX/RX_BANDWIDTH_L*
   - Fallback: nvidia-smi nvlink, Nsight, NVSwitch counters
-  - Long all-to-all blocks with idle SMs → communication bottleneck
+  - Long all-to-all blocks with idle SMs → communication bottleneck 
+
+4/21/26:
+- Catch NCCL errors -- scraped by FLuentd/AWS CloudWatch -- put them on top of the GPU utilization graphs in Grafana → correlate GPU idle periods with NCCL failures
+
+Application-level optimizations:
+
+Dynamic Batching/Scheduling/Routing
+
+Dynamic batching: 
+
+- Groups requests for a few ms to form batches, boosting throughput and GPU utilization
+- Batching adds tiny delay at low load, but reduces overall and tail latency at high load
+- Batch size and delay are tuned to meet p99 latency SLOs (e.g., 1–2 ms delay) and according to Requests per second (RPS) patterns
+- Adaptive batching keeps latency flat as throughput rises, up to an inflection point
+
+Continuous batching: 
+- Continuous batching: at every token step, evict finished requests and admit waiting ones — GPU slots always full
+- Result: 2-3x throughput on large models, minimal latency cost, ideal for chat/low-latency workloads
+
+CONTINUOUS BATCHING vs CONTINUOUS SCHEDULING
+════════════════════════════════════════════
+
+  Continuous BATCHING:  "same kernel, many requests in one tensor"
+    → works when sequences can share a matmul
+    → evicts finished, admits new, at each token step
+
+  Continuous SCHEDULING: "many kernels, many streams, GPU interleaves warps"
+    → works when sequences CAN'T share a matmul (different shapes, padding waste)
+    → launches 10 small decode kernels on 10 CUDA streams
+    → GPU's warp scheduler interleaves them like an OS interleaves processes
+
+
+WHY NEEDED — THE DECODE PROBLEM
+────────────────────────────────
+  Decode = generate 1 token at a time per request
+  Small compute + heavy memory movement → GPU underutilized
+
+  10 users decoding different-length sequences:
+    Can we batch into one big matmul? NO — too much padding
+    Can we run them sequentially?      NO — GPU sits idle between
+
+  Solution: launch 10 small kernels on 10 streams → warp scheduler
+            interleaves them → GPU stays busy
+
+
+VISUAL
+──────
+  Sequential (bad):
+    Stream 0: [k1]        [k2]        [k3]     ← GPU idle between
+
+  Continuous scheduling (good):
+    Stream 0: [k1─────────────]
+    Stream 1:    [k1─────────────]
+    Stream 2:       [k1─────────────]
+    Stream 3:          [k1─────────────]
+    → warp scheduler interleaves on SMs, no idle time
+
+
+SUMMARY (one-liners)
+────────────────────
+- Continuous scheduling treats the GPU like an OS scheduler does a CPU — many small kernels on separate streams, warp scheduler interleaves them
+- Used when decode workloads are too small/varied to batch into one matmul
+- One kernel stalls on I/O → another proceeds → no idle cycles
+- Production engines (vLLM, SGLang) combine continuous batching + continuous scheduling to kill GPU "bubbles"
+- PagedAttention (vLLM): KV cache split into pages, group page compute across sequences
+- RadixAttention (SGLang): tree-based KV cache + lazy eviction for unused pages
+

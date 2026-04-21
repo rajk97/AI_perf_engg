@@ -374,4 +374,26 @@ Chunked prefill (stall-free scheduling) — summary
 
 Mnemonic: chunking helps latency scheduling, not compute complexity.
 
+Latency-aware scheduling and dynamic routing — summary
+
+- FIFO batches by arrival order; latency-aware scheduling batches by expected cost so one GPU does not get stuck with all the long prompts
+- In the example, rebalancing prompt lengths cuts the critical path from 38M to 22M attention ops, so TTFT improves a lot
+- Core idea: move shorter prompts earlier and spread long prompts across GPUs to balance prefill work
+- Works best when attention kernels operate on true sequence lengths; padding-heavy kernels reduce the benefit
+
+Mnemonic: do not batch by arrival order, batch by compute weight.
+
+Systems-level optimizations:
+
+Overlapping Communication and Computation
+
+- Goal: keep GPUs doing useful work nearly 100% of the time by hiding communication behind computation
+- Main technique: use separate CUDA streams, async copies, pinned host memory, and sync only when data is actually needed
+- In distributed inference, overlap collectives too: chunk transfers so one chunk computes while the next chunk is being sent
+- Extras: enable GPUDirect RDMA, NCCL group calls, and sometimes SHARP to reduce communication overhead further
+
+Mnemonic: move data in the background, keep compute in the foreground.
+
+
+
 

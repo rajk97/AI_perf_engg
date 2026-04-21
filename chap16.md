@@ -365,3 +365,13 @@ SUMMARY (one-liners)
 - PagedAttention (vLLM): KV cache split into pages, group page compute across sequences
 - RadixAttention (SGLang): tree-based KV cache + lazy eviction for unused pages
 
+Chunked prefill (stall-free scheduling) — summary
+
+- Split a very long prompt into smaller prefill chunks so decode can run in between instead of waiting behind one giant prefill step
+- Chunking does not reduce total attention work; it only reshapes it into smaller scheduling units
+- Benefit: lower per-iteration stall, smoother tail latency, better overlap between prefill and decode
+- Cost intuition: same total attention compute, more predictable latency
+
+Mnemonic: chunking helps latency scheduling, not compute complexity.
+
+

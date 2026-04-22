@@ -463,6 +463,39 @@ KV cache management by engine:
 
 Mnemonic: bad memory management = fragmentation = OOM = GPU out of pool = cascading failure.
 
+Quantization for inference — summary
+
+  ┌──────────────┬──────────┬──────────┬──────────────────────────────────┐
+  │ Format       │ Size vs  │ Tensor   │ Notes                            │
+  │              │ FP16     │ Core tput│                                  │
+  ├──────────────┼──────────┼──────────┼──────────────────────────────────┤
+  │ FP16 / BF16  │ 1x       │ 1x       │ Baseline for LLM inference       │
+  │ TF32         │ 1x       │ 2x       │ torch.set_float32_matmul_        │
+  │              │          │          │ precision("high") — easy win     │
+  │ FP8          │ 0.5x     │ 2x FP16  │ NVIDIA TE, static or dynamic     │
+  │              │          │          │ amax scaling, near no accuracy   │
+  │              │          │          │ loss                             │
+  │ FP4 (NVFP4) │ ~0.3x    │ 4x FP16  │ Needs per-block microscaling,    │
+  │              │          │          │ limited dynamic range            │
+  └──────────────┴──────────┴──────────┴──────────────────────────────────┘
+
+Weight-only quantization (keep activations in FP16/FP8):
+  ┌──────────┬──────────────────────────────────────────────────────┐
+  │ GPTQ     │ Post-training, layer-by-layer, 3-4 bit INT weights  │
+  │          │ ~4x smaller, ~2x faster, 99%+ accuracy retained     │
+  ├──────────┼──────────────────────────────────────────────────────┤
+  │ AWQ      │ Identifies "salient" weight channels (large activat-│
+  │          │ ion magnitudes), protects them with per-channel      │
+  │          │ scaling before casting rest to INT4                  │
+  │          │ better accuracy than GPTQ at 3-4 bit                │
+  └──────────┴──────────────────────────────────────────────────────┘
+
+- NVIDIA Transformer Engine (TE): manages per-tensor / per-block scaling automatically
+- MoE bonus: lower precision weights → fit more experts in HBM → fewer CPU swaps
+- Frameworks (vLLM, TensorRT-LLM, HuggingFace) load GPTQ/AWQ checkpoints natively
+
+Mnemonic: FP16 → FP8 = half the memory + 2x math; GPTQ/AWQ = 4x smaller weights with no meaningful accuracy loss.
+
 
 
 

@@ -394,6 +394,31 @@ Overlapping Communication and Computation
 
 Mnemonic: move data in the background, keep compute in the foreground.
 
+Overlap patterns — summary
+
+- Overlap at every boundary: GPU compute with NCCL collectives, CPU preprocessing with GPU work, pipeline-stage sends with next-stage compute, and token generation with network streaming
+- Practical recipe: split work into chunks, launch comms asynchronously on separate streams/threads, and use CUDA events only at true dependency points
+- GPUDirect RDMA helps cross-node transfers by letting NICs access GPU memory directly without host-memory staging, reducing CPU overhead and latency
+- Core benefit: fewer GPU idle bubbles, smoother latency, and higher throughput with no change in model outputs
+
+Mnemonic: if two things do not depend on each other, pipeline them.
+
+Maximizing GPU utilization — throughput vs latency trade-off
+
+- Target useful GPU utilization (goodput), not raw 100% — running at 100% can trigger thermal/power throttling
+- Plot a throughput-vs-latency curve across batch sizes: there is always a "knee" where more throughput starts costing too much latency
+- Rule of thumb: cap batch size at ~90% of peak throughput (headroom buffer) for predictable latency without meaningful throughput loss
+- Monitor p95/p99 tail latency, not just p50 — in large clusters even 0.1% outliers are frequent
+- Reducing tail latency has direct cost benefits: less overprovisioning needed to meet SLOs
+
+Tuning recipe:
+  1. Turn on full concurrency and overlap first
+  2. Gradually increase batch size until resource utilization peaks
+  3. Measure single-query latency at that point
+  4. Scale batch size back just enough to meet p99 SLO
+
+Mnemonic: aim for 90% utilization with predictable latency, not 100% with throttle-induced spikes.
+
 
 
 

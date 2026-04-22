@@ -419,6 +419,50 @@ Tuning recipe:
 
 Mnemonic: aim for 90% utilization with predictable latency, not 100% with throttle-induced spikes.
 
+Power and thermal constraints — summary
+
+- 100% GPU utilization can trigger thermal throttling or power-limit downclocks → lower-than-expected performance
+- Monitor with: DCGM_FI_DEV_CLOCK_THROTTLE_REASONS (throttle reason), DCGM_FI_DEV_POWER_USAGE (power draw), nvidia-smi "Pwr Throttle" flag
+- Software mitigations: add tiny interbatch delay, limit concurrency, cap GPU clocks via nvidia-smi -lgc
+- Hardware mitigations: improve cooling, raise power cap via nvidia-smi -pl
+- Best practice: add a "boost-off" flag in the inference engine that auto-activates on detected throttling → runs slightly cooler until stability is restored
+
+Mnemonic: 100% utilization + bad cooling = throttle = slower than 90% with good cooling.
+
+Error handling, memory, and KV cache — summary
+
+Error handling:
+- Fail fast: if a request will error, return error immediately, do not waste GPU time
+- Implement timeouts + backpressure: on error spikes, reject new requests or shrink batch
+- Keep 10-15% idle buffer capacity at steady state; critical services need 100% replica
+- Autoscaling is too slow for sudden spikes; prewarmed idle nodes are the only real answer
+
+Memory:
+  ┌────────────────────────────────────────────────────┐
+  │ GPU HBM = model weights + KV cache                 │
+  │                                                    │
+  │ ALWAYS keep model weights in HBM                   │
+  │ (paging to CPU or NVMe adds transfer latency)      │
+  │                                                    │
+  │ KV cache grows with: queries × input length        │
+  │ → compress (FP8/INT4) or offload rarely-used entries│
+  │ → use pool allocators to keep fragmentation < 5%   │
+  │   (naive allocators = 20-30% fragmentation = OOM)  │
+  └────────────────────────────────────────────────────┘
+
+KV cache management by engine:
+  ┌────────────────┬───────────────────────────────────┐
+  │ vLLM           │ PagedAttention: paged pool,        │
+  │                │ offloads to CPU/NVMe              │
+  ├────────────────┼───────────────────────────────────┤
+  │ SGLang         │ RadixAttention: tree-based cache,  │
+  │                │ lazy eviction of unused prefixes   │
+  ├────────────────┼───────────────────────────────────┤
+  │ NVIDIA Dynamo  │ Similar pool + offload mechanism   │
+  └────────────────┴───────────────────────────────────┘
+
+Mnemonic: bad memory management = fragmentation = OOM = GPU out of pool = cascading failure.
+
 
 
 

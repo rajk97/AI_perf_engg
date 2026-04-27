@@ -496,6 +496,109 @@ Weight-only quantization (keep activations in FP16/FP8):
 
 Mnemonic: FP16 → FP8 = half the memory + 2x math; GPTQ/AWQ = 4x smaller weights with no meaningful accuracy loss.
 
+5/27/26:
+
+Activation quantization and PTQ workflow — summary
+
+- Activation quantization reduces memory traffic for KV cache reads/writes and MLP intermediate activations, not just weight traffic
+- Hard part: activations change a lot across inputs, so naive low-bit activation quantization can hurt accuracy more than weight-only quantization
+- Practical middle ground: INT8 activations with calibration
+  - TensorRT/NVIDIA INT8 flow builds activation histograms on representative prompts
+  - Then chooses per-tensor scaling factors that map activation ranges safely into INT8
+- SmoothQuant: shifts some quantization difficulty from activations into weights using simple scaling
+  - Result: W8A8 or full INT8 inference with very small accuracy loss
+  - Often used before GPTQ/AWQ so low-precision weight quantization holds accuracy better
+
+PTQ workflow:
+
+  FP16/FP32 trained model
+            │
+            ├─ representative prompts
+            ▼
+    calibration / PTQ script
+    (GPTQ / AWQ / SmoothQuant)
+            │
+            ├─ choose scales / clipping / packing
+            ▼
+      quantized checkpoint
+            │
+            ├─ optional light recovery fine-tune
+            ▼
+       inference serving engine
+
+- PTQ = cheapest path for production
+- QAT = higher accuracy ceiling, but much more compute and engineering work
+- Small calibration sets can still help a lot: percentile clipping, loss-aware scale tuning, ~1k prompts
+- Always validate on downstream tasks and A/B real responses because PTQ can amplify borderline errors or subtle safety regressions
+
+Combining weight + activation quantization
+
+  ┌──────────────┬──────────────────────────────┬──────────────────────────────┐
+  │ Scheme       │ What runs in math core       │ Trade-off                    │
+  ├──────────────┼──────────────────────────────┼──────────────────────────────┤
+  │ W4A8 INT4/8  │ INT4 weights + INT8 acts     │ Highest raw integer speed,   │
+  │              │ on INT8 Tensor Cores         │ needs careful calibration    │
+  ├──────────────┼──────────────────────────────┼──────────────────────────────┤
+  │ W4A8 INT4/FP8│ INT4 weights unpacked to FP8 │ Better dynamic range, near-  │
+  │ hybrid       │ + FP8 activations on FP8 TC  │ lossless when calibrated     │
+  ├──────────────┼──────────────────────────────┼──────────────────────────────┤
+  │ NVFP4 path   │ FP4 blocks + microscaling    │ Biggest compression, most    │
+  │              │ via Transformer Engine       │ sensitive to scaling         │
+  └──────────────┴──────────────────────────────┴──────────────────────────────┘
+
+- Production default is often: 4-bit weights + 8-bit activations
+- Safer rollout order: W8 first → W4 weight-only → W4A8 only if more savings are still needed
+
+Fused quant-dequant in inference — what actually happens
+
+- The model is not quantizing and dequantizing the same tensor back and forth as separate full steps
+- Instead, low-bit values stay packed in memory, and conversion happens inside the GEMM kernel right before math
+
+  Memory:   packed INT4 weights
+                 +
+            INT8 / FP8 activations
+                 │
+                 ▼
+      fused kernel loads tile
+                 │
+                 ├─ unpack INT4 bytes
+                 ├─ apply scale / zero-point
+                 ├─ convert to compute format
+                 │    (FP8 / INT8 / higher-precision accumulator)
+                 ▼
+             Tensor Core MMA
+                 ▼
+         accumulate + write output
+
+- So yes: there is a logical dequantization step, but it is tiny, tiled, and fused into the compute kernel
+- Why fuse it:
+  - no extra kernel launch
+  - no full temporary dequantized tensor in HBM
+  - less memory bandwidth wasted
+  - keeps quantization gains instead of paying conversion overhead separately
+- Think of it as on-the-fly decoding of compressed weights at the point of use, not a separate preprocessing pass
+
+Mnemonic: store compressed, unpack at the math unit, never materialize the full dequantized tensor.
+
+- Visual:
+- Separate path:
+- packed weights
+-   ↓ dequant kernel
+- full dequantized tensor in memory
+-   ↓ GEMM kernel
+- output
+
+- Fused path:
+- packed weights
+-   ↓
+- fused GEMM kernel:
+-   load → unpack/dequantize tile → compute
+-   ↓
+- output
+
+
+
+
 
 
 

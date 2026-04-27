@@ -596,6 +596,100 @@ Mnemonic: store compressed, unpack at the math unit, never materialize the full 
 -   ↓
 - output
 
+Application-level optimizations — summary
+
+- These are serving-layer wins, not model-weight changes or hardware upgrades
+- Goal: reduce input work, avoid redundant compute, route smarter, improve perceived latency
+- Typical levers: prompt compression, prompt cleansing, prefix caching, deduplication, fallback routing, streaming output
+
+Why this matters
+
+  Longer prompt
+      ↓
+  more prefill tokens
+      ↓
+  more attention work
+      ↓
+  higher cost + slower TTFT
+
+  Since attention cost grows roughly with prompt length squared:
+  smaller prompt window = much cheaper prefill
+
+Prompt compression
+
+- Remove text the model does not actually need
+- Best cases:
+  - irrelevant pasted content
+  - stale chat history
+  - verbose repeated system instructions
+- Common production policy:
+  - if conversation > ~75% of context limit
+  - summarize oldest ~25%
+  - prepend summary + keep recent turns verbatim
+- Benefit:
+  - lower prefill cost
+  - fewer context-limit failures
+  - better focus on recent turns
+- Risk:
+  - bad summaries can drop facts the user still cares about
+
+Compression flow:
+
+  old long chat
+      ↓
+  summarize old turns
+      ↓
+  keep recent turns
+      ↓
+  new shorter prompt
+      ↓
+  faster prefill
+
+- Good guardrail:
+  - summarize
+  - then verify important facts survived
+  - only keep compression if key answers still match
+
+Prompt cleansing
+
+- Strip useless formatting before tokenization
+- Examples:
+  - extra blank lines
+  - noisy HTML / markdown wrappers
+  - repetitive punctuation
+  - fancy quotes / odd unicode forms
+- Each cleanup may save only a few tokens, but across many requests it adds up
+
+Prompt trimming tricks
+
+  ┌────────────────────┬────────────────────────────────────────────┐
+  │ Technique          │ Idea                                       │
+  ├────────────────────┼────────────────────────────────────────────┤
+  │ Summarization      │ Compress old or irrelevant content         │
+  ├────────────────────┼────────────────────────────────────────────┤
+  │ Truncation         │ Drop low-value old turns                   │
+  ├────────────────────┼────────────────────────────────────────────┤
+  │ References         │ Replace repeated long text with an ID      │
+  │                    │ like file0                                 │
+  ├────────────────────┼────────────────────────────────────────────┤
+  │ Session prompt set │ Reuse one system prompt across requests    │
+  ├────────────────────┼────────────────────────────────────────────┤
+  │ Config tokens      │ Use special tokens as shorthand for long   │
+  │                    │ policy/system prompts                      │
+  └────────────────────┴────────────────────────────────────────────┘
+
+- Config-token idea:
+  - replace 200 natural-language policy tokens with a few trained special tokens
+  - same behavior target, much smaller prefill cost
+- This needs model training or fine-tuning support, but inference payoff can be large
+
+Rule of thumb
+
+- Do not send raw text just because you have it
+- Send only the tokens needed for the model to answer well
+
+Mnemonic: fewer prompt tokens = cheaper prefill = faster responses.
+
 
 
 

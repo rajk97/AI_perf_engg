@@ -690,6 +690,116 @@ Rule of thumb
 
 Mnemonic: fewer prompt tokens = cheaper prefill = faster responses.
 
+Prefix caching — summary
+
+- Many requests share the same beginning of the prompt
+  - same system prompt
+  - same document prefix
+  - same chat history up to the latest turn
+- Instead of recomputing that prefix every time, reuse the KV cache for the matching prefix
+- Also called prefix memoization
+
+Core idea
+
+  repeated prefix
+        ↓
+  compute KV once
+        ↓
+  store in prefix cache
+        ↓
+  next request with same prefix
+        ↓
+  skip prefix prefill
+        ↓
+  compute only the new suffix
+
+- Big win: repeated long prefixes stop paying repeated attention cost
+- Mental model:
+  - without cache: encode long prefix again and again
+  - with cache: jump directly to the part that changed
+
+Common examples
+
+- Shared system prompt across many users
+- One long document + many different questions
+- Multiturn chat where old conversation is the shared prefix for the next turn
+
+Document QA example
+
+  [long document] + Question 1
+  [long document] + Question 2
+  [long document] + Question 3
+
+  Without prefix cache:
+  - encode document 3 times
+
+  With prefix cache:
+  - encode document once
+  - reuse KV
+  - only compute Question 1 / 2 / 3 suffixes
+
+- Result can be near-linear speedup when the shared prefix is large and reused often
+
+Chat-session view
+
+  Turn 1: [history] + user msg 1
+  Turn 2: [history + msg 1 + reply 1] + user msg 2
+  Turn 3: [history + ...] + user msg 3
+
+- Keep KV from earlier turns
+- On new turn, compute only the new user message and new generated tokens
+- This is why later turns in the same chat can feel much faster than the first turn
+
+Memory trade-off
+
+- Prefix caching saves compute but consumes memory
+- Large numbers of live conversations can fill GPU memory quickly
+- Engines like vLLM page inactive KV blocks to CPU or disk and page them back on hits
+- Tune cache size based on real prefix-hit rate
+  - high reuse → larger cache
+  - low reuse → smaller cache or disable it
+
+Deduplication
+
+- Stronger version of reuse: if two requests arrive with the exact same prefix, compute once and share
+- Can also deduplicate repeated subprompts within a request, though that is rarer in inference
+
+How lookup works
+
+- Prefix cache is usually a trie (prefix tree)
+- Each edge = one token
+- Walking root → node gives a token sequence prefix
+- New request walks token by token until match stops
+- Longest matched node tells the engine which KV prefix can be reused
+
+Trie view
+
+  root
+   └─ You
+       └─ are
+           └─ ChatGPT
+               └─ ...
+
+  New prompt walks the tree
+  Stop where next token no longer matches
+  Reuse KV up to that node
+  Compute only the rest
+
+- SGLang RadixAttention uses a radix tree
+  - compressed trie with multi-token edges
+  - more space efficient
+  - supports fast longest-prefix search, insertion, and LRU-style eviction
+
+Production checklist
+
+- Enable prefix caching in the serving engine
+- Give it enough memory to matter
+- Measure prefix hit rate in production
+- Cache helps only if prefixes actually repeat
+- Best workloads: chat, repeated system prompts, document QA, templated enterprise prompts
+
+Mnemonic: same prefix twice = compute once, reuse forever until eviction.
+
 
 
 

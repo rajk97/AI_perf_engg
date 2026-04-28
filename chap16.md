@@ -878,6 +878,139 @@ Figure takeaway
 
 Mnemonic: find deepest shared prefix, clone its KV, grow the tree, evict cold leaves.
 
+Model cascading and streaming responses — summary
+
+Model cascading / tiered deployment
+
+- Not every query needs the biggest model
+- Keep multiple models online: small/fast/cheap and large/slow/expensive
+- Route each request based on complexity, confidence, or system load
+
+Core idea
+
+  incoming query
+        ↓
+  router / heuristic / classifier
+        ↓
+   easy? ── yes ──→ small model
+        │
+        no
+        ↓
+     large model
+
+- Two-stage fallback pattern:
+  - try small model first
+  - if confidence is low, escalate to large model
+- Goal:
+  - cut average latency
+  - cut average compute cost
+  - still preserve quality on hard requests
+
+Trade-off
+
+  many easy queries
+      ↓
+  small model handles them fast
+      ↓
+  large model is reserved for hard cases
+
+  but:
+  small then large fallback
+      ↓
+  one hard request may take longer end-to-end
+
+- Sometimes systems run small and large models in parallel for suspected hard queries
+- Wasteful on compute, but useful when latency matters more than cost
+
+How to route
+
+- Simple heuristics often work first:
+  - short factual query → small model
+  - long / creative / explain / analyze / elaborate → large model
+- More advanced options:
+  - confidence from small-model logits
+  - separate lightweight classifier
+  - capacity-aware routing during overload
+
+Capacity-based routing
+
+- If big-model cluster is overloaded:
+  - send less critical traffic to smaller model
+  - accept slight quality drop to avoid timeout or long queues
+- Common real-world pattern:
+  - premium users keep large model
+  - free-tier users get smaller model during peak load
+
+Operational requirements
+
+- Cascading reduces cost only if the router is good enough
+- Router/classifier itself must stay lightweight, fast, and monitored
+- Log every request with:
+  - model used
+  - whether fallback happened
+  - latency
+  - quality / acceptance outcome
+- Use these logs to tune thresholds and improve routing rules over time
+
+Deployment reminder
+
+- Multi-model systems need independent scaling for each model pool
+- Small model can become the bottleneck if too much traffic shifts to it
+- Orchestrators can scale pools separately or move GPUs between pools
+
+Streaming responses
+
+- Streaming improves perceived latency, even when total generation time is unchanged
+- Show tokens as they are produced instead of waiting for the whole answer
+
+Visual
+
+  Without streaming:
+  wait........wait........wait........FULL ANSWER
+
+  With streaming:
+  first tokens → more tokens → more tokens → complete answer
+
+- Users can start reading almost immediately
+- This feels much faster than a blank screen followed by one large dump
+
+Human-reading target
+
+- Good stream pace is roughly human reading speed:
+  - about 4-13 tokens/sec
+- If the system only streams at ~2 tokens/sec, optimization is still needed
+
+Practical streaming behavior
+
+- Engines like vLLM, SGLang, and NVIDIA Dynamo stream over:
+  - WebSockets
+  - SSE
+  - HTTP streaming
+- Do not wait too long before flushing
+- But also do not send one tiny packet per token unless needed
+- Common compromise:
+  - flush every 2-5 tokens
+  - or at newline / sentence boundary
+
+Streaming trade-off
+
+- Slight extra network overhead from many small packets
+- Usually negligible compared with model compute time
+- Persistent connections and HTTP/2 help reduce transport overhead
+
+Example
+
+  100-token answer in 5 seconds
+  with 5-token flushes at 20 tok/s:
+
+  first visible output in 0.25s
+  then steady batches until completion
+
+- Without streaming, user waits full 5 seconds staring at nothing
+
+Mnemonic: route easy work to small models, and stream early so users never stare at a blank screen.
+
+
 
 
 

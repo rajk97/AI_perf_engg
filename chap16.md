@@ -1010,6 +1010,129 @@ Example
 
 Mnemonic: route easy work to small models, and stream early so users never stare at a blank screen.
 
+Streaming flow control, debouncing, and output limits — summary
+
+Low-latency streaming details
+
+- Small token flushes can get delayed by TCP behavior
+- Nagle's algorithm + delayed ACKs can add tens of milliseconds, sometimes much worse
+- For ultra-low latency streaming:
+  - use `TCP_NODELAY`
+  - use quick-ack / lower delayed-ack timers where available
+- Trade-off:
+  - lower token-send latency
+  - more small packets
+  - worse bandwidth efficiency
+
+Flow control
+
+- Slow clients should not stall token generation
+- Keep network send path separate from the main generation path
+- Use separate threads / async handlers / CUDA streams for send-side work
+- Main rule:
+
+  model generates tokens
+        ↓
+  bounded output buffer
+        ↓
+  network sender drains buffer
+        ↓
+  slow client does not directly block decode loop
+
+- Use a bounded buffer so stalled or disconnected clients do not cause unbounded memory growth
+- Typical buffer idea: allow maybe 50-100 tokens to queue
+- Beyond the limit:
+  - pause generation
+  - or close the connection and reclaim resources
+
+Token pooling / smoothing
+
+- Sometimes the model generates in bursts faster than you want to display
+- UI may look smoother if tokens are released at a steadier pace
+- Trick: add a small configurable delay between sends for a typewriter effect
+- Example:
+  - model bursts 20 tokens quickly
+  - server spaces them out with ~50 ms send intervals
+- Useful for UX shaping or tiered service levels
+  - paid users stream faster
+  - free users stream a bit slower
+
+Early stop / interrupt
+
+- Streaming lets users stop bad generations early
+- This saves compute and improves UX
+- Monitor explicit stop events:
+  - many stops can mean model drift, verbosity, irrelevance, or user frustration
+- Early-stop metrics are useful tuning signals for:
+  - answer length
+  - relevance
+  - max generated tokens
+
+Profiling guidance
+
+- Compare end-to-end latency with streaming on vs off
+- Check that token emission is evenly spaced
+- Watch for lock contention, sender-thread stalls, and I/O waits
+- Load-test with simulated clients at scale
+
+Debouncing and request coalescing
+
+- Users sometimes click or resubmit multiple times quickly
+- Debouncing waits briefly before acting so duplicates can be merged or dropped
+
+Visual
+
+  click click click
+       ↓
+   short debounce window
+       ↓
+  keep latest / merge duplicates
+       ↓
+   less wasted backend work
+
+- Server can:
+  - drop duplicates
+  - keep only latest request
+  - coalesce near-identical requests
+- Good debounce window is small, around a few milliseconds
+- Too much debounce adds visible latency and can annoy already-frustrated users
+- Best paired with UI protections too:
+  - disable input while request is in flight
+
+Token output limits and timeouts
+
+- Long generations directly increase latency and tie up GPUs
+- Put hard limits on:
+  - max output tokens
+  - wall-clock generation time
+- If request runs too long:
+  - return partial result
+  - or fail fast with a clear message
+
+Why limits help
+
+  longer generation
+       ↓
+  more GPU time
+       ↓
+  worse tail latency
+       ↓
+  harder capacity planning
+
+- Limits prevent runaway generations, abuse, and rambling answers
+- Moderate caps can improve quality by forcing conciseness
+- Timeouts make worst-case latency predictable
+
+Big picture
+
+- Input trimming reduces work
+- Prefix caching avoids repeated work
+- Model routing spends compute selectively
+- Streaming improves perceived speed
+- Debouncing and limits stop waste
+
+Mnemonic: stream fast, buffer safely, drop duplicates, cap runaway outputs.
+
 
 
 

@@ -800,6 +800,83 @@ Production checklist
 
 Mnemonic: same prefix twice = compute once, reuse forever until eviction.
 
+4/28/26:
+
+RadixAttention cache flow and eviction — summary
+
+- At generation start, the engine asks the radix tree for the longest cached prefix
+- `radix.longest_prefix(prompt_tokens)` walks multi-token edges down to the deepest matching node
+- Then `ModelState.from_cache(node.cache)` clones references to that KV page
+- Result: model state starts from the cached prefix without rerunning self-attention on it
+
+Fast path
+
+  incoming prompt
+       ↓
+  longest_prefix lookup
+       ↓
+  deepest matching node
+       ↓
+  clone cached KV page
+       ↓
+  skip cached prefix work
+       ↓
+  compute only unseen suffix
+
+- After that, the engine processes only the suffix tokens that were not cached
+- As each new token is consumed, it updates the radix tree incrementally
+  - insert new edge or split existing edge
+  - attach the latest `model_state.kv_cache`
+- Once prompt prefill ends, decoding continues autoregressively
+- Newly generated prefixes are also inserted into the tree, so future reuse keeps growing automatically
+
+Two phases
+
+  Prefill:
+  cached prefix + new suffix tokens
+
+  Decode:
+  generate next token
+      ↓
+  update model_state
+      ↓
+  insert new prefix into radix tree
+
+- Why this design works well:
+  - reuses common prefixes across chat turns, few-shot prompts, and branching flows
+  - stores KV in large coalesced chunks for efficient GPU access
+  - supports cheap incremental updates instead of rebuilding the cache structure
+
+Eviction policy
+
+- Cache memory is limited, so some prefixes must be evicted when GPU memory is tight
+- Common policy: LRU = least recently used prefix is removed first
+- SGLang lazily evicts least recently used radix-tree leaves under memory pressure
+- Effect:
+  - hot prefixes stay resident
+  - cold conversation branches get dropped first
+
+Visual
+
+  Many requests
+      ↓
+  shared prefixes become shared tree nodes
+      ↓
+  active nodes stay hot
+      ↓
+  memory pressure arrives
+      ↓
+  oldest unused leaves evicted
+
+Figure takeaway
+
+- One chat can grow from an existing cached branch
+- A second chat can split off and still share the same system-prompt prefix
+- Unrelated prompts can force new root branches
+- When memory runs out, old branches from inactive chats are evicted first
+- This lets the tree keep the highest-value shared prefixes alive
+
+Mnemonic: find deepest shared prefix, clone its KV, grow the tree, evict cold leaves.
 
 
 

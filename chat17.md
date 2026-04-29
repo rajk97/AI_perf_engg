@@ -103,3 +103,134 @@ Scale takeaway
 - This improves utilization, latency, QoS, and cost efficiency across very large clusters
 
 Mnemonic: prefill wants FLOPS, decode wants bandwidth, so split them before they fight.
+
+Goodput, phase-specific tuning, and cluster pools — summary
+
+Goodput under latency SLOs
+
+- Important rule: throughput only counts if both latency SLOs are met
+- Example SLOs:
+	- P90 TTFT <= 0.4 s
+	- P90 TPOT <= 0.04 s
+- Colocated system example:
+	- ~3 RPS within TTFT bound
+	- ~1.6 RPS within TPOT bound
+	- so real goodput = 1.6 RPS because both bounds must hold
+
+2P1D example
+
+- Configuration:
+	- 2 prefill GPUs
+	- 1 decode GPU
+- Measured capacity:
+	- each prefill side together: 5.6 x 2 = 11.2 RPS total prefill capacity
+	- decode side: 10 RPS total decode capacity
+- End-to-end system goodput is limited by the slower side:
+
+	total goodput = min(prefill capacity, decode capacity)
+								= min(11.2, 10)
+								= 10 RPS total
+
+	per-GPU goodput = 10 RPS / 3 GPUs = 3.3 RPS per GPU
+
+- Main lesson:
+	- decode-side improvement helps TPOT
+	- prefill isolation helps TTFT
+	- both SLOs must pass for requests to count as useful throughput
+
+- Disaggregation also tightens tail latency because phases stop interfering with each other
+- Cost question still matters:
+	- more GPUs can improve goodput and latency
+	- but you must decide if the cost/perf trade-off is worth it for your workload
+
+Phase-specific optimizations
+
+- Prefill tuning:
+	- compute-bound
+	- prefers more tensor parallelism when needed to drive FLOPS
+	- benefits strongly from low precision like FP8 / FP4
+- Decode tuning:
+	- memory-bandwidth-bound
+	- often prefers little or no tensor parallelism because sync overhead hurts
+	- benefits from fused kernels and high-memory-throughput GPUs
+
+Visual
+
+	Prefill:
+	more compute, more parallel math, lower precision helps
+
+	Decode:
+	more KV traffic, less cross-GPU sync, bandwidth matters most
+
+- Monolithic serving forces one GPU choice and one parallelism strategy for both phases
+- Disaggregation lets each phase choose what fits best
+
+Heterogeneous clusters
+
+- You can assign different GPU types to different roles
+- Example:
+	- compute-optimized GPUs for prefill
+	- memory-optimized GPUs for decode
+- This can improve throughput per dollar versus using one GPU type everywhere
+- Newest GPUs often work well for both, but heterogeneity remains a useful cost lever
+
+Profiling reminder
+
+- Use Nsight Systems and related tools to inspect:
+	- prefill kernels
+	- decode kernels
+	- RDMA / KV transfers
+	- overlap between communication and compute
+
+Disaggregated cluster pools
+
+- Basic setup:
+	- one pool of prefill workers
+	- one pool of decode workers
+	- a scheduler/router coordinates KV handoff between them
+- Practical design keeps them in the same data center to preserve latency SLOs
+
+Visual
+
+	client request
+			 ↓
+	 decode worker ingress
+			 ↓
+	decide: local prefill or offload?
+			 ↓
+	prefill worker computes KV
+			 ↓
+	KV transferred over fast interconnect
+			 ↓
+	decode worker generates tokens
+
+Interconnect / transfer path
+
+- KV handoff should use fast GPU-to-GPU networking:
+	- NVLink / NVSwitch
+	- InfiniBand
+	- GPUDirect RDMA
+	- UCX / NIXL-style transport
+- Goal: move KV without host copies and with minimal latency
+
+Decode-centric design
+
+- Common architecture: request enters on decode worker first
+- Why:
+	- prefill workers are already compute-heavy
+	- decode nodes can handle client I/O, session state, routing, and policy logic
+	- simplifies ingress, autoscaling, and control flow
+- Alternative: dedicated API router in front
+	- works too
+	- but adds another moving part and more coordination overhead
+
+Role example
+
+- Prefill workers:
+	- fewer, heavier compute-oriented GPUs
+- Decode workers:
+	- more memory-oriented GPUs with larger decode pool
+- Specialized accelerators can also appear:
+	- e.g. context-processing chips aimed specifically at prefill
+
+Mnemonic: goodput = throughput that satisfies both TTFT and TPOT, and disaggregation lets each phase use the hardware it actually wants.

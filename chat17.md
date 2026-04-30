@@ -234,3 +234,117 @@ Role example
 	- e.g. context-processing chips aimed specifically at prefill
 
 Mnemonic: goodput = throughput that satisfies both TTFT and TPOT, and disaggregation lets each phase use the hardware it actually wants.
+
+KV handoff, elastic scaling, and prefill-worker design — summary
+
+Heterogeneous worker example
+
+- Prefill workers can use compute-strong GPUs
+- Decode workers can use high-HBM GPUs
+- Example pattern:
+	- B200-like GPUs for compute-heavy prefills
+	- B300-like GPUs for memory-heavy decodes
+- Goal: match GPU strengths to phase bottlenecks while lowering cost
+
+NIXL / GPUDirect RDMA handoff
+
+- KV cache should move directly GPU-to-GPU with minimal control overhead
+- NIXL abstracts the transport layer for:
+	- NVLink
+	- RDMA / UCX fabrics
+	- GPUDirect Storage tiers
+- Decode workers register regions of GPU memory that remote prefill workers can write into directly
+
+Fast path
+
+	decode worker reserves KV buffer
+				 ↓
+	buffer registered for RDMA
+				 ↓
+	small descriptor / ID shared via control plane
+				 ↓
+	prefill worker computes KV
+				 ↓
+	prefill worker writes KV directly into decode GPU memory
+				 ↓
+	decode starts token generation
+
+- Key idea: send small buffer IDs/descriptors, not bulky full memory metadata every time
+- Discovery/control plane tools such as etcd can manage worker discovery, leases, and handle exchange
+- First-contact setup is heavier; steady-state control messages stay lightweight
+
+Layout mismatch note
+
+- If prefill and decode use different tensor-parallel layouts, decode must do a KV layout transform after receiving the transfer
+- This is cheaper than recomputing prefill and usually small relative to network transfer time
+
+Elastic scaling
+
+- Prefill and decode scale independently
+- If long prompts dominate, add prefill workers
+- If long outputs dominate, add decode workers
+- Because phases are separated, scaling one role does not directly disrupt the other
+
+Dynamic cluster behavior
+
+- Some runtimes can add/remove workers without stopping the cluster
+- New workers register and begin pulling tasks
+- If prefill workers disappear, decode workers can temporarily do more local prefill to absorb the gap
+- This flexibility matters at ultrascale where load changes constantly
+
+Prefill worker design
+
+- Prefill workers are prompt servers optimized for heavy forward-pass compute
+- They should use GPUs with high FLOPS and strong large-GEMM performance
+- They commonly use:
+	- tensor parallelism
+	- pipeline parallelism
+	- and, when needed, data / expert / context parallelism
+
+Memory behavior
+
+- Prefill workers must hold:
+	- model weights
+	- working activations for forward pass
+	- temporary KV cache for the prompt
+- Important detail:
+	- KV cache is produced, transferred out, then usually does not stay long on the prefill node
+- Many systems preallocate a large memory region for prefill workspace to reduce fragmentation and allocation overhead
+
+Latency vs throughput trade-off on prefill
+
+Latency-first mode
+
+- Start prompts immediately with little or no batching
+- Best for minimizing TTFT
+- Cost:
+	- lower GPU utilization
+	- fewer concurrent requests served per cluster
+- Useful when strict latency SLOs matter more than utilization
+
+Throughput-first mode
+
+- Batch prompts together before launching prefill
+- Best for maximizing total RPS and keeping GPUs full
+- Cost:
+	- batching delay before execution starts
+	- larger batches increase wait time for each request
+
+Visual
+
+	Latency-first:
+	prompt arrives → run now
+
+	Throughput-first:
+	prompt arrives → wait for batch → run full GPU
+
+- Large-batch prefill raises arithmetic intensity and overall utilization
+- But it can worsen TTFT for individual prompts
+- Extreme throughput setups may even assign multiple GPUs per request
+
+Rule of thumb
+
+- Use latency-first when TTFT SLOs are strict
+- Use throughput-first when total served RPS matters more than individual prompt start time
+
+Mnemonic: prefill workers are prompt factories, so feed them FLOPS, ship KV fast, and choose between instant starts or fuller batches.

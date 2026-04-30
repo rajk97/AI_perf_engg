@@ -348,3 +348,126 @@ Rule of thumb
 - Use throughput-first when total served RPS matters more than individual prompt start time
 
 Mnemonic: prefill workers are prompt factories, so feed them FLOPS, ship KV fast, and choose between instant starts or fuller batches.
+
+RK: It looks like prefill is compute bound but optimized for latency, while decode is memory bound but optimized for throughput. Disaggregation lets each phase pick the hardware and scheduling that fits its needs best.
+
+Prefill scheduling trade-offs and decode-worker design — summary
+
+Using more GPUs per prefill request
+
+- Data parallelism:
+	- full model replicated on each GPU
+	- batch split across GPUs
+	- outputs aggregated at the end
+- Benefit:
+	- more aggregate compute and memory bandwidth for that batch
+- Cost:
+	- fewer independent requests can run at once
+	- too many GPUs per request hurts cluster-wide concurrency
+
+- Pipeline parallelism:
+	- model layers split across GPUs by stage
+	- microbatches flow through like an assembly line
+- Benefit:
+	- better per-batch throughput when balanced well
+- Cost:
+	- inter-GPU communication overhead
+	- pipeline bubbles if stage split or microbatch size is poor
+
+Visual
+
+	Data parallel:
+	same model on many GPUs
+	batch split across them
+
+	Pipeline parallel:
+	GPU0 stage A -> GPU1 stage B -> GPU2 stage C
+	microbatches flow through the stages
+
+- Core trade-off:
+	- more GPUs per request = more throughput for that request
+	- but fewer total simultaneous requests in a fixed cluster
+
+Latency-aware scheduling and batching
+
+- Scheduler should choose the largest batch/parallelism plan that still satisfies TTFT SLOs
+- At low load:
+	- often batch size 1
+	- run immediately
+- At higher load:
+	- allow small batching window, e.g. 2-10 ms
+	- collect a microbatch only when the delay is acceptable
+
+Adaptive policy
+
+	low load    -> run now
+	medium load -> tiny batching window
+	high load   -> fuller batches, more aggressive packing
+
+- Many systems intentionally bias prefill toward latency, not perfect utilization
+- Reason: fast first token improves UX more than squeezing every last GPU cycle
+- Common practice:
+	- overprovision prefill capacity
+	- absorb prompt bursts without TTFT spikes
+
+Autoscaling and priority classes
+
+- Orchestrators can scale each tier independently
+- Example:
+	- prefill utilization high, decode low -> add prefill workers
+- Useful signals:
+	- prefill queue length
+	- per-tier utilization
+	- TTFT SLO miss rate
+- Priority / fast-lane scheduling also helps:
+	- short prompts on low-batching fast lane
+	- long prompts on throughput-optimized lane
+
+Decode worker design
+
+- Decode workers are generation servers focused on low TPOT and many concurrent sequences
+- They receive ready KV cache and continue autoregressive generation efficiently
+- In decode-centric designs, request often lands on decode first
+	- decode decides local prefill vs remote prefill
+	- if remote, request is pushed to prefill queue
+	- prefill worker may reuse prefix cache, compute missing prefix, and write KV back
+	- decode worker resumes generation
+
+Decode flow
+
+	request arrives at decode worker
+					↓
+	 local prefill or remote prefill?
+					↓
+		if remote: enqueue prefill task
+					↓
+		prefill reads prefix cache + computes missing KV
+					↓
+		KV written back to decode worker
+					↓
+		decode pipeline starts token generation
+
+- Decode-worker priorities:
+	- handle many active sequences at once
+	- keep KV memory footprint under control
+	- reduce TPOT with continuous batching and strong memory management
+
+KV transfer into decode
+
+- Decode scheduler allocates destination KV blocks first
+- Remote prefill request carries identifiers for those blocks
+- Prefill worker uses NIXL to do direct GPU memory reads/writes over the chosen transport
+- Transfer should be nonblocking so compute and data movement overlap
+- Best practice:
+	- preregister peer memory
+	- use large pinned windows
+	- reduce reregistration churn
+
+Profiling check
+
+- Verify with Nsight Systems that:
+	- KV transfer is zero-copy
+	- RDMA overlaps compute
+	- decode is not stalling on transfers
+
+Mnemonic: prefill scheduling chooses between immediacy and packing, while decode lives or dies by overlapped KV movement and low TPOT.

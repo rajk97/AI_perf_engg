@@ -471,3 +471,107 @@ Profiling check
 	- decode is not stalling on transfers
 
 Mnemonic: prefill scheduling chooses between immediacy and packing, while decode lives or dies by overlapped KV movement and low TPOT.
+
+Continuous batching, sequence grouping, and decode launch — summary
+
+Nsight Systems profiling for end-to-end disaggregated runs
+
+- Use `nsys profile` with traces for CUDA, OSRT, NVTX, UCX, GDS
+- Add NIC + IB switch metrics for full network telemetry
+- Result: correlated CUDA kernels + UCX activity + storage + network behavior
+- Helpful flags:
+  - `--trace=cuda-hw,osrt,nvtx,ucx,gds`
+  - `--gpu-metrics-device=all`
+  - `--nic-metrics=true`
+  - `--ib-switch-metrics-device=<GUIDs>`
+  - `--storage-metrics --gds-metrics=driver`
+
+Layout transform reminder
+
+- If prefill and decode use different TP layouts
+- Insert a layout-transform kernel on the receiver after NIXL read
+- Realigns KV blocks to the layout decode expects before use
+
+Continuous batching (iteration-level batching)
+
+- Decode = many small per-token vector-matrix ops → low arithmetic intensity
+- Solution: batch the next-token step across many active sequences
+- 32 active requests → one forward pass produces 32 next tokens
+
+Visual
+
+  Without batching:
+  seq1 step → seq2 step → seq3 step → ... (GPU underused)
+
+  With continuous batching:
+  every iteration:
+    gather all sequences ready for next token
+    run one big matmul
+    emit one token per sequence
+
+- Batch size fluctuates each step:
+  - finished sequences leave immediately
+  - newly-ready sequences (just out of prefill) join next iteration
+  - long prompts not yet ready are skipped until ready
+- Always tries to maximize batch up to a limit
+- High load → big batch, high throughput
+- Low load → small batch, low latency (no waiting)
+
+Why decode pools love this
+
+- Disaggregated decode GPUs do only decode
+- Never interrupted by a giant bespoke prefill
+- Smoother throughput, more predictable TPOT
+
+vLLM knobs
+
+- `--max-num-seqs`: max concurrent decode slots per iteration
+- `--max-num-batched-tokens`: total tokens per iteration cap
+- `--max-seq-len-to-capture`: CUDA Graph capture coverage; longer seqs fall back to eager
+- Set explicitly for predictable memory behavior
+
+Other engines
+
+- DeepSpeed and TensorRT-LLM also implement continuous / in-flight batching with paged KV
+- Common idea: scheduler groups decode tasks across streams + paged cache keeps memory tight
+
+Variable-length sequence grouping
+
+- Mixing short and long prompts in one batch causes padding waste
+- Padding can be up to ~50% of tokens in some workloads
+- Padded "no-op" tokens still cost GPU cycles + memory + network
+
+Fix: bucket by length
+
+  ┌────────────────┬───────────────────────────┐
+  │ Bucket         │ Range                     │
+  ├────────────────┼───────────────────────────┤
+  │ short          │ 0-512 tokens              │
+  ├────────────────┼───────────────────────────┤
+  │ medium         │ 513-1024 tokens           │
+  ├────────────────┼───────────────────────────┤
+  │ long           │ 1025+ tokens              │
+  └────────────────┴───────────────────────────┘
+
+- Each batch contains similar-length sequences → minimal padding
+
+vLLM SequenceGroup pool
+
+- Rotating pool of SequenceGroups (one per prompt)
+- Each iteration advances each group by a fixed token budget
+- Finished groups leave; new groups join
+- Keeps pipeline full without static padding buckets
+
+Decode-launch optimizations
+
+- Per-token kernel launches add overhead → "bubbles" between decode iterations
+- NVIDIA features that reduce this:
+  - Programmatic Dependent Launch (PDL): overlap dependent kernels at end of a decode step
+  - Device-initiated CUDA Graph Launch: launch graphs from the GPU itself
+- Usage notes:
+  - instantiate with `cudaGraphInstantiateFlagDeviceLaunch`
+  - keep nodes on a single device
+  - usually exposed through the framework, not hand-coded
+- Effect: trims launch bubbles between decode iterations → lower TPOT
+
+Mnemonic: continuous batching = fluid roster of sequences per iteration; bucket by length to kill padding; PDL + device graphs kill launch bubbles.

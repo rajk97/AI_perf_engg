@@ -575,3 +575,119 @@ Decode-launch optimizations
 - Effect: trims launch bubbles between decode iterations → lower TPOT
 
 Mnemonic: continuous batching = fluid roster of sequences per iteration; bucket by length to kill padding; PDL + device graphs kill launch bubbles.
+
+KV cache memory management for decode
+
+Combined stack recap
+
+- Length-bucketing + continuous batching + disaggregation + PDL + device-launched CUDA Graphs
+- Used by vLLM, SGLang, NVIDIA Dynamo
+- Goal: high throughput AND low latency, even with wildly varying prompt lengths
+
+vLLM tuning notes
+
+- `--max-seq-len-to-capture` (default 8192): max seq length covered by CUDA Graphs
+- vLLM may pad to nearest captured size → align other knobs to avoid waste
+- Tune together:
+  - `--max-num-seqs`
+  - `--max-num-batched-tokens`
+  - `--max-seq-len-to-capture`
+- CUDA Graphs ≠ batching control; batching is run by the SequenceGroup pool
+
+Why KV cache is the decode bottleneck
+
+- Decode attends to ALL prior tokens (prompt + already-generated)
+- Each sequence stores K and V tensors for every layer × every past token
+- KV memory grows linearly with token count
+- Decode workers can hit GPU memory limit just from KV, before model weights matter
+
+KV size formula
+
+- bytes_per_token = 2 × n_layers × n_kv_heads × head_dim × bytes_per_element
+- The 2× = keys AND values per layer per token
+- Use the model's actual values; FP8/FP4 change bytes_per_element
+
+Worked example: Llama-class 13B, 40 layers, head_dim=128, 4096 tokens
+
+  ┌──────────┬──────────┬──────────────┬──────────────┐
+  │ Attn     │ n_kv_hd  │ FP16 KV      │ FP8 KV       │
+  ├──────────┼──────────┼──────────────┼──────────────┤
+  │ MHA      │ 40       │ ~3.36 GB     │ ~1.68 GB     │
+  ├──────────┼──────────┼──────────────┼──────────────┤
+  │ GQA (8)  │ 8        │ ~0.671 GB    │ ~0.336 GB    │
+  ├──────────┼──────────┼──────────────┼──────────────┤
+  │ MQA      │ 1        │ ~0.084 GB    │ —            │
+  └──────────┴──────────┴──────────────┴──────────────┘
+
+- MHA = full keys/values per head
+- GQA = query heads share KV across groups
+- MQA = all heads share one KV
+
+Strategies decode workers use to manage KV
+
+- Paged GPU memory allocator
+  - vLLM PagedAttention: KV cache split into fixed-size pages
+  - Inactive pages can swap to CPU
+  - Also in SGLang, TensorRT-LLM, Dynamo
+  - LMCache-style projects layer DRAM + NVMe tiers, schedule recompute vs I/O
+
+- High-memory GPUs + custom allocators
+  - Blackwell B200 = 180 GB HBM
+  - Blackwell B300 = 288 GB HBM
+  - Fixed-size pages reduce fragmentation, enable prefix reuse, scale to many seqs
+
+- KV offloading / paging out
+  - Push older KV blocks to CPU RAM or NVMe
+  - Bring back on demand → small latency penalty
+  - Prefetch / overlap to hide it
+
+- Context limits + compression
+  - Hard cap on output length = bounded KV growth
+  - Lower-precision KV (FP16 → FP8 → INT8) shrinks footprint
+  - Architectural: MQA, GQA, DeepSeek MLA all reduce KV size
+
+Memory hierarchy advantage of disaggregation
+
+- Decode GPU memory = model weights + KV cache only
+- No transient prefill memory spikes stealing room
+- Example budget on a 180 GB GPU:
+  - weights: 70 GB
+  - leftover for KV: ~122 GB
+  - → bounds (concurrent_seqs × tokens_per_seq) on that GPU
+- Disaggregation lets you pick decode HW for memory capacity + bandwidth
+
+Visual
+
+  ┌─────────────────────────────────────────────┐
+  │ Decode GPU HBM                              │
+  ├─────────────────────────────────────────────┤
+  │ [ model weights ] [ KV cache pages ......] │
+  │                       ↑ paged, evictable    │
+  │                       ↓ overflow → CPU/NVMe │
+  └─────────────────────────────────────────────┘
+
+When to offload prefill
+
+- Sending a request to remote prefill pool isn't free
+  - queueing delay
+  - network transfer (KV back to decode)
+- Only offload when it actually helps latency / utilization
+- Decision = a routing policy
+
+Disaggregated routing strategies
+
+  ┌──────────────────┬──────────────────────────────────────┐
+  │ Strategy         │ How it picks a worker                │
+  ├──────────────────┼──────────────────────────────────────┤
+  │ Round robin      │ next node in rotation                │
+  ├──────────────────┼──────────────────────────────────────┤
+  │ Least requests   │ worker with fewest active requests   │
+  ├──────────────────┼──────────────────────────────────────┤
+  │ Prefix aware     │ uses request's prefix to pick worker │
+  ├──────────────────┼──────────────────────────────────────┤
+  │ KV aware         │ worker whose KV cache best matches   │
+  └──────────────────┴──────────────────────────────────────┘
+
+- Prefix/KV-aware = exploit cache locality → fewer recomputes, faster TTFT
+
+Mnemonic: KV cache is the silent memory hog of decode — page it, compress it, share it via prefix routing, or it eats your HBM before throughput ever does.

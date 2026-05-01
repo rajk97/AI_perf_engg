@@ -691,3 +691,115 @@ Disaggregated routing strategies
 - Prefix/KV-aware = exploit cache locality → fewer recomputes, faster TTFT
 
 Mnemonic: KV cache is the silent memory hog of decode — page it, compress it, share it via prefix routing, or it eats your HBM before throughput ever does.
+
+Routing factors: when to offload prefill
+
+Core question
+
+- Decode worker gets a request → run prefill locally OR offload to prefill pool?
+- Offload isn't free (queue + KV transfer back)
+- Goal: maximize cache hits, balance load, hit TTFT SLO
+
+Routing factor table
+
+  ┌──────────────────┬───────────────────────────────────────────────┐
+  │ Factor           │ Decision effect                               │
+  ├──────────────────┼───────────────────────────────────────────────┤
+  │ prompt length    │ long → offload; short → local                 │
+  ├──────────────────┼───────────────────────────────────────────────┤
+  │ prefix cache hit │ big hit → local (effectively short)           │
+  │                  │ no hit  → offload                             │
+  ├──────────────────┼───────────────────────────────────────────────┤
+  │ prefill queue    │ long  → local (pool saturated)                │
+  │                  │ light → offload OK                            │
+  ├──────────────────┼───────────────────────────────────────────────┤
+  │ decode load      │ busy  → offload to free decode GPU            │
+  │                  │ idle  → can do prefill locally                │
+  ├──────────────────┼───────────────────────────────────────────────┤
+  │ SLO urgency      │ high prio → offload for fast TTFT             │
+  │                  │ low prio  → local or delay                    │
+  └──────────────────┴───────────────────────────────────────────────┘
+
+Effective prompt length idea
+
+- effective_len = prompt_length − prefix_cached_length
+- Big prefix hit → smaller effective_len → cheap → keep local
+- Also: transferring cached KV out and back would be pointless
+- Full cache hit → no prefill at all, decode runs immediately
+
+Prefill queue as load-shedding signal
+
+- Long queue = "pool can't keep up"
+- System gracefully falls back to local prefill
+- Queue drains → offloading resumes
+- Self-balancing equilibrium between decode and prefill tiers
+
+KV-cache-aware router (vLLM)
+
+- Workers emit KV cache events
+- Router tracks which worker holds which prefix
+- New request → routed to worker with best cache match
+- Effect: fewer recomputes, less cross-worker KV traffic
+
+QoS / priority class hooks
+
+- High-priority request → bypass checks, offload immediately
+- Low-priority → local or delayed
+- Reserve decode workers for urgent decode-side tasks
+
+Tuning thresholds empirically
+
+- E.g. <50 tokens → faster local on a B200
+- New GPUs (more FLOPS + BW) → break-even prompt length goes UP
+- Re-tune `PREFILL_LENGTH_THRESHOLD` etc. on hardware upgrades
+
+Pseudo-policy (decode worker side)
+
+- inputs: prompt_length, prefix_cached_length, prefill_queue_size, decode_active_reqs, ttft_slo_ms
+- compute: eff_len = max(0, prompt_length − prefix_cached_length)
+- tunables (B200/B300 example):
+  - PREFILL_LENGTH_THRESHOLD = 256
+  - PREFILL_QUEUE_MAX        = 10
+  - DECODE_LOAD_THRESHOLD    = 8
+- decision rules:
+  - long_prefill   = eff_len ≥ PREFILL_LENGTH_THRESHOLD
+  - pool_available = prefill_queue_size < PREFILL_QUEUE_MAX
+  - if long_prefill AND pool_available → OFFLOAD
+  - elif decode_active_reqs ≥ DECODE_LOAD_THRESHOLD AND eff_len ≥ 64 → OFFLOAD
+  - else → LOCAL
+
+Decision flow
+
+  request arrives
+        │
+        ▼
+  effective_len = prompt_len − prefix_cached_len
+        │
+        ▼
+  ┌──────────────────────────────────┐
+  │ long prefill AND pool free?      │── yes ──► OFFLOAD
+  └──────────────────────────────────┘
+        │ no
+        ▼
+  ┌──────────────────────────────────┐
+  │ decode busy AND prompt moderate? │── yes ──► OFFLOAD
+  └──────────────────────────────────┘
+        │ no
+        ▼
+       LOCAL prefill (better cache locality, lower overhead)
+
+Worker behavior after decision
+
+- Offload = push prompt to global prefill queue, do other work, await KV return
+- Local  = decode worker runs prefill itself, then enters decode loop
+- If prefill pool starts lagging → new requests naturally fall back to local
+
+Why this conditional strategy wins
+
+- Short / cache-hitting prompts: fast TTFT locally, no overhead
+- Long / cold prompts: parallelism via remote prefill
+- Prefill pool used only when it pays off
+- Optimizes goodput (useful throughput under SLO), not just raw throughput
+- Used in DistServe, vLLM, NVIDIA Dynamo
+
+Mnemonic: offload only when the prompt is long, the cache is cold, and the prefill pool has room — otherwise stay local and ride the cache.

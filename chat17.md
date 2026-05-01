@@ -803,3 +803,93 @@ Why this conditional strategy wins
 - Used in DistServe, vLLM, NVIDIA Dynamo
 
 Mnemonic: offload only when the prompt is long, the cache is cold, and the prefill pool has room — otherwise stay local and ride the cache.
+
+Routing config, capacity-aware planning, latency-aware routing
+
+Production routing = config-driven, not hard-coded
+
+- Tools like NVIDIA Dynamo read JSON/YAML at startup (or dynamically)
+- Operators tune behavior without code changes
+
+Example Dynamo Planner config (annotated)
+
+  ┌─────────────────────────────────────────────────────────┐
+  │ split_policy                                            │
+  │   prompt_length_threshold: 256                          │
+  │   prefix_cache_weight:  10.0   ← cache hit dominates    │
+  │   queue_length_weight:   1.5                            │
+  │   decode_load_weight:    0.5                            │
+  │   enable_hotspot_prevention: true                       │
+  ├─────────────────────────────────────────────────────────┤
+  │ cache                                                   │
+  │   reuse_prefix: true                                    │
+  │   min_cache_hit_ratio: 0.75                             │
+  ├─────────────────────────────────────────────────────────┤
+  │ autoscale.prefill                                       │
+  │   replicas: 4 .. 12                                     │
+  │   scale_up:   queue ≥ 8  OR gpu_util ≥ 80%              │
+  │   scale_down: queue ≤ 2  AND gpu_util ≤ 40%             │
+  ├─────────────────────────────────────────────────────────┤
+  │ autoscale.decode                                        │
+  │   replicas: 8 .. 24                                     │
+  │   scale_up:   queue ≥ 16 OR kv_cache_usage ≥ 75%        │
+  │   scale_down: queue ≤ 4  AND kv_cache_usage ≤ 30%       │
+  ├─────────────────────────────────────────────────────────┤
+  │ qos                                                     │
+  │   enable_early_rejection: true                          │
+  │   low_priority_threshold_ms: 500                        │
+  │   reject_on_slo_violation: true                         │
+  └─────────────────────────────────────────────────────────┘
+
+Capacity-aware routing (Dynamo GPU Planner)
+
+- Continuously watches: TTFT, TPOT, KV transfer cost, GPU util
+- Can do three things:
+  1. modify routing (offload more / less)
+  2. rescale a tier (add or remove prefill/decode replicas)
+  3. switch to monolithic (no disaggregation) for a request
+- Reacts to workload shape:
+
+  workload type        → planner action
+  ───────────────────────────────────────────────
+  big summarization     → shift GPUs toward prefill
+  reasoning / long gen  → shift GPUs toward decode
+  short, balanced       → stay monolithic, same GPU
+
+- Goal: keep both TTFT and TPOT within SLO during traffic surges
+
+Latency-aware routing
+
+- Beyond simple thresholds: pick worker with lowest latency cost
+- Each candidate worker gets a real-time score
+- Lowest score = freest / best fit → request goes there
+
+Simple latency cost example
+
+- latency_cost = 0.7 × occupancy_percent + 0.3 × active_req_count
+- occupancy_percent = how busy the GPU is
+- active_req_count  = in-flight request count
+- weights tuned empirically:
+  - if KV memory pressure causes most slowdowns → bump KV-usage weight
+  - if queue length dominates                  → bump queue weight
+
+Visual: per-request worker selection
+
+  request
+     │
+     ▼
+  for each worker:
+     score = w1·occupancy + w2·active_reqs + w3·kv_use + ...
+     │
+     ▼
+  pick worker with min(score)
+
+More advanced cost factors (foreshadowed)
+
+- KV cache match (prefix locality)
+- KV cache pressure (HBM headroom)
+- network distance / NIC saturation
+- TTFT-so-far for queued requests
+- worker-specific HW (B200 vs B300)
+
+Mnemonic: simple thresholds offload, configs declare policy, planners reshape capacity, and latency-cost routers pick the freshest worker per request — four layers of "where should this token go?".

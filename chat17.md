@@ -1019,3 +1019,96 @@ Visual: load → action ladder
 
 Mnemonic: lower cost = better worker (cache match dominates), race two paths for tail latency, and when the cluster is overloaded, shed gracefully before violating everyone's SLO.
 
+Early rejection internals, scalability, key takeaways
+
+QoS controller pseudocode
+
+- inputs: priority, ttft_slo_ms
+- estimate TTFT from live metrics:
+  - est_ttft = (prefill_queue_len × avg_prefill_time_per_req)
+  -          + (decode_queue_len  × avg_decode_time_per_req)
+- decision:
+  - if est_ttft > ttft_slo_ms AND priority == "low" → reject
+  - else → admit
+- high-priority always accepted; may preempt queued low-priority work
+
+How the averages are computed
+
+- avg_prefill_time_per_req / avg_decode_time_per_req
+  - exponential moving average of observed durations
+  - normalized per token (per prompt token / per generated token)
+  - extrapolated by current request's token count
+- Queue lengths come from the scheduler's internal queues
+- Refreshed by scheduler loop (~1 s) via /metrics endpoint
+
+Adaptive generation limits
+
+- Under pressure, cap output length below user request
+- E.g. user asked 1000 tokens → system serves 200 tokens, stops
+- Frees decode capacity for other requests
+- Trades quality for SLO compliance
+
+Coordination with the LLM gateway
+
+- Gateway returns "server busy" / overload code to client
+- Better: explicit failure than oversubscription that breaks everyone
+
+Scalability of disaggregated PD
+
+- Scales near-linearly:
+  - more prefill nodes → more prompt throughput
+  - more decode nodes → more token throughput
+- Hard part = balance, especially at scale
+  - traffic patterns shift
+  - dynamic prefill:decode ratio is critical
+  - adaptive schedulers matter more as cluster grows
+
+Multimodel serving on disaggregated clusters
+
+- Decode pool can be shared across models with similar decode profile
+- Particularly nice for LoRA adapters (same base model)
+- Result: multitenant, multimodel, PD-disaggregated server
+- Each model can have its own prefill frontend, common decode pool
+
+Tail latency at ultrascale
+
+- Big systems = more nodes = more chance one is slow / failing
+- Disaggregation isolates phase-side failures (slow prefill ≠ slow decode)
+- Levers that mitigate stragglers:
+  - early rejection
+  - two-level scheduling
+  - KV cache reuse (less recompute on miss-of-one-node)
+- Disaggregated systems hold tail latency steadier as load grows
+
+Key takeaways (chapter 17)
+
+  ┌────────────────────────────────┬──────────────────────────────────────┐
+  │ Principle                      │ Why                                  │
+  ├────────────────────────────────┼──────────────────────────────────────┤
+  │ Eliminate PD interference      │ no head-of-line blocking, tighter    │
+  │                                │ TTFT/TPOT distributions              │
+  ├────────────────────────────────┼──────────────────────────────────────┤
+  │ Optimize each phase            │ prefill = compute-bound (FP8/FP4,    │
+  │ independently                  │ high FLOPS); decode = memory-bound   │
+  │                                │ (high HBM BW, continuous batching)   │
+  ├────────────────────────────────┼──────────────────────────────────────┤
+  │ Leverage KV cache              │ skip recompute, route by prefix      │
+  ├────────────────────────────────┼──────────────────────────────────────┤
+  │ Route intelligently            │ multifactor scoring; track TTFT and  │
+  │                                │ ITL/TPOT separately at p50/p95/p99   │
+  ├────────────────────────────────┼──────────────────────────────────────┤
+  │ Use QoS to keep SLAs           │ admission control + prioritization;  │
+  │                                │ fast-fail before everyone breaks     │
+  └────────────────────────────────┴──────────────────────────────────────┘
+
+Note: ITL (inter-token latency) = TPOT in many schedulers/dashboards.
+
+Conclusion
+
+- Disaggregated PD is now standard at MANGO (Meta, Amazon, NVIDIA, Google, OpenAI)
+- Open source: vLLM, SGLang, NVIDIA Dynamo
+- Wins: higher goodput, better cost-efficiency vs monolithic
+- Combined with KV reuse, smart routing, QoS → maintains latency at billion-RPS scale
+
+Mnemonic: separate the phases, tune each for its bottleneck, route by cache + load, and protect the SLO with admission control — that's the recipe for fast LLM serving at planet scale.
+

@@ -893,3 +893,129 @@ More advanced cost factors (foreshadowed)
 - worker-specific HW (B200 vs B300)
 
 Mnemonic: simple thresholds offload, configs declare policy, planners reshape capacity, and latency-cost routers pick the freshest worker per request — four layers of "where should this token go?".
+
+Advanced latency-aware routing, multipath, and QoS
+
+Cost factor table (lower cost = better worker)
+
+  ┌────────────────────────┬──────────────────────────────┬─────────┐
+  │ Factor                 │ Meaning                      │ Δ cost  │
+  ├────────────────────────┼──────────────────────────────┼─────────┤
+  │ KV occupancy %         │ memory pressure              │ +3      │
+  │ active_req_count       │ in-flight queueing risk      │ +1      │
+  │ cache_match_flag       │ exact prefix already cached  │ −10     │
+  │ mem_bw_percent         │ memory bus busy              │ +0.5    │
+  │ recent_prefix_flag     │ warm L2 / inflight KV        │ −1      │
+  └────────────────────────┴──────────────────────────────┴─────────┘
+
+Composite cost (Python-style)
+
+- cost =
+-   3.0 × occupancy_percent
+- + 1.0 × active_reqs
+- − 10.0 × int(cache_match_flag)
+- + 0.5 × mem_bw_percent
+- − 1.0 × int(recent_prefix_flag)
+
+Notes
+
+- Big negative for cache match → can override busyness; a slightly busy worker WITH the prefix beats an idle worker without it
+- Prefill vs decode can use different formulas:
+  - prefill → weight cache match more
+  - decode  → weight KV space + mem BW more
+- Needs continuous telemetry per worker (queue, KV, mem util, BW)
+
+Behavior under load
+
+- Low load: all scores low → choice doesn't matter
+- High load: balances toward freest workers + locality wins
+- Effect: smaller average AND tail latency
+
+NVIDIA Dynamo: same idea, inverted (higher = better)
+
+- Computes a remote_prefill_score
+- If score > `remote_prefill_min_score` → offload to prefill pool
+
+Example Dynamo YAML
+
+  ┌──────────────────────────────────────────────────────────┐
+  │ disaggregated_router:                                    │
+  │   policies:                                              │
+  │     - metric: prefill_length     thr: 256                │
+  │       action: prefer_remote      weight: 0.7             │
+  │     - metric: prefill_queue_depth thr: 10                │
+  │       action: prefer_local       weight: 0.3             │
+  │   remote_prefill_min_score: 0.5                          │
+  └──────────────────────────────────────────────────────────┘
+
+- prompt > 256 → vote remote (×0.7)
+- queue > 10 → vote local (×0.3)
+- combined > 0.5 → offload, else local
+
+Multipath inference (racing)
+
+- Send same request along 2 paths (e.g. 2 model sizes / 2 routes)
+- Take whichever finishes first
+- Used by Google + Meta to cut tail latency
+- Costs: extra GPU cycles
+- Rules:
+  - requests must be idempotent
+  - cancel the slower path ASAP
+
+Speculative decoding × routing
+
+- Speculative decode = parallel token branches, drop wrong ones
+- Router can spread speculative branches across decode workers
+- Hides branch unpredictability → trades compute for lower TPOT
+- Must bound resource use to avoid swamping cluster
+
+Role of latency-aware router
+
+- "Brain" of distributed serving
+- Works with per-GPU schedulers + KV strategies + global scaling
+- Goal: maximize goodput, minimize p99 latency
+
+QoS and early rejection (admission control)
+
+Why
+
+- Even great clusters get overloaded
+- Better to shed some load than violate SLO for everyone
+- Analogous to HTTP 503 in web servers
+
+Components
+
+- Latency SLO tracking
+  - know target TTFT (e.g. 200 ms p99) and TPOT
+  - estimate impact of admitting a new request given current state
+
+- Admission control / early rejection
+  - if admitting would blow SLO → reject now ("server busy, try later")
+  - decision can be node-local or global view
+  - real example: APIs that error during heavy backlog instead of stalling
+  - some providers shrink max generation length during peak
+
+- Prioritization
+  - tag requests: high (paying / critical) vs low (free / background)
+  - high-priority served first; low-priority can wait or be fast-failed
+  - prefill queue + decode scheduler both honor priority
+
+- Graceful degradation
+  - smaller model for low-priority
+  - truncate prompts / cap output length
+  - temporarily disable remote prefill for low-priority during stress
+    - low-priority requests do local prefill only
+    - prefill pool stays free for high-priority
+
+Visual: load → action ladder
+
+  load level     │ system response
+  ───────────────┼────────────────────────────────────────
+  light          │ everyone served normally
+  rising         │ deprioritize remote prefill for low-prio
+  high           │ shrink max output length for low-prio
+  saturated      │ early-reject low-prio (queue > X ms)
+  critical       │ early-reject all but high-prio + SLO
+
+Mnemonic: lower cost = better worker (cache match dominates), race two paths for tail latency, and when the cluster is overloaded, shed gracefully before violating everyone's SLO.
+

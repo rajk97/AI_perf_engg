@@ -114,3 +114,118 @@ Why this matters
 - Future-proof: new sparsity ideas can be tried in Python
 
 Mnemonic: FlashMLA fuses, ThunderMLA repacks the tail, FlexDecoding JIT-compiles per pattern — three answers to "decode is small, slow, and irregular."
+
+Tuning KV cache: disaggregated pools and prefix sharing
+
+Profiling note
+
+- Verify kernel overlap with Nsight Systems (CUDA hw traces)
+- Use Nsight Compute for memory + link metrics
+- Custom kernels are usually picked up by PyTorch / vLLM / SGLang quickly
+
+Why KV cache becomes a first-class shared resource
+
+- With disaggregation, KV outlives a single request and can move between nodes
+- Treat it like a cluster-wide store, not per-GPU scratch
+- Two big techniques: distributed KV pool, prefix reuse across requests
+
+Disaggregated KV cache pool
+
+- Decouple KV storage from individual GPUs
+- Spread KV blocks across the whole cluster's GPU memory
+- Spill to CPU DRAM (Grace Blackwell / Vera Rubin unified memory) or NVMe
+- Multitier hierarchy ≈ OS virtual memory:
+  - hot KV  → GPU HBM
+  - warm KV → CPU RAM
+  - cold KV → NVMe
+
+Visual
+
+  ┌─────────────────────────────────────────────────────────┐
+  │  Disaggregated KV pool                                  │
+  ├──────────────┬──────────────┬───────────────────────────┤
+  │ GPU HBM      │ CPU DRAM     │ NVMe                      │
+  │ active KV    │ overflow     │ long-tail / cold context  │
+  └──────────────┴──────────────┴───────────────────────────┘
+                ↑ async paging, overlapped with compute
+
+Worked KV size example
+
+- Model: 70B, 80 layers, 32 heads × 128 dim → hidden 4096
+- Per token per layer: 2 × 4096 floats = 8192 floats (K + V)
+- Per token total: 80 × 8192 = 655,360 floats
+- FP16 (2 B/float) → ~1.31 MB per token
+- 250,000-token chat session → ~328 GB just for KV
+- FP8 + selective-layer caching → ~100–150 GB
+- Still won't fit on one GPU with weights → need to spill or recompute
+
+Why this is a big deal
+
+- Without pool: must truncate context OR recompute (O(N²) attention)
+- With pool: page older blocks out, fetch back when needed
+- Async paging hides under compute → near-zero stall
+
+Other wins from a global pool
+
+- Any decode node can pick up any request → failover + load balance
+- Crash mid-gen → KV survives in pool, another node continues
+- Cross-request reuse: shared prefix computed once, used everywhere
+- Locality-aware scheduling: send decode to node closest to its KV
+
+Trade-off
+
+- Extra hop to fetch KV from pool
+- But still cheaper than recomputing quadratic attention
+- Trades memory + cold storage for compute
+
+KV cache reuse and prefix sharing
+
+When prefixes overlap
+
+- Multiturn conversations
+- Shared system prompts ("You are a helpful assistant…")
+- Attached documents reused across requests
+- Skipping prefill on the matched prefix saves huge compute
+
+vLLM automatic prefix caching
+
+- Built on PagedAttention
+- Each 16-token block has a content hash
+- Global hash table maps hash → KV block
+- Match → copy the cached KV instead of recomputing
+
+Visual
+
+  new prompt: [block1][block2][block3][block4]
+                hash    hash    hash    hash
+                  ↓       ↓       ↓       ↓
+               cache   cache   cache    miss
+              ────────────────────────► only block4 needs prefill
+
+Cache management
+
+- Match strategy: exact prefix match (simple, robust)
+- Partial-overlap merging is hard — usually skipped
+- Eviction: LRU or "likelihood of reuse" heuristics
+- Prompt-tree structures track shared prefix subtrees
+
+Locality-aware routing for prefix hits
+
+- If node A already holds the prefix's KV → route to A
+- Avoids cross-node KV transfer
+- "Send compute to the data" (classic distributed-systems rule)
+
+Why a global KV view matters
+
+- Without it: same conversation hitting different nodes recomputes prefix
+- With it: any node sees any cached prefix → fewer redundant prefills
+- Especially valuable in disaggregated clusters where requests bounce around
+
+Trade-offs of caching
+
+- More cached KV = more memory used
+- Need eviction policies
+- Hot prefixes worth keeping, rare ones worth dropping
+- Goal: maximize hit rate within memory budget
+
+Mnemonic: KV cache wants to be a cluster-wide tiered storage system — pool it across GPUs/RAM/NVMe, hash prefixes for reuse, and route compute toward where the KV already lives.

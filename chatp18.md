@@ -229,3 +229,112 @@ Trade-offs of caching
 - Goal: maximize hit rate within memory budget
 
 Mnemonic: KV cache wants to be a cluster-wide tiered storage system — pool it across GPUs/RAM/NVMe, hash prefixes for reuse, and route compute toward where the KV already lives.
+
+KV cache memory layout, POD-Attention, GB200, and fast PD transfer
+
+KV cache size grows fast
+
+- Per stream: ≈ num_layers × 2 × seq_len × d_head
+- Many concurrent decodes → huge HBM footprint
+- Keep active KV in GPU memory (latency)
+- Spill older KV to CPU / NVMe / compress when possible
+
+Paged KV layout (FlashMLA style)
+
+- Allocate KV in fixed-size pages
+- Active sequence's pages live contiguously
+- Benefits: fewer cache misses, less DRAM traffic, better coalesced access
+
+Prefix compression / eviction
+
+- Long conversations → context window slides
+- Old tokens won't be attended to → drop or compress their KV
+- Saves memory + HBM bandwidth on long sequences
+- ⚠ Safe only when attention is sliding-window or otherwise restricted
+- ⚠ NOT safe for layers with full-context attention or retrieval hooks unless evaluated
+
+POD-Attention (SM-aware CTA scheduling)
+
+- Reorganizes attention to reduce HBM traffic
+- One kernel launches enough CTAs to cover BOTH prefill + decode work
+- Each CTA at runtime inspects its SM and per-SM counters
+- Picks role: prefill or decode, based on what's already running there
+- Result: prefill + decode colocate on the same SM
+
+Visual
+
+  Without POD:
+  SM0: ████prefill████      (bursty HBM reads)
+  SM1: ████prefill████
+  SM2:                ░░decode░░░  (bursty later, mem-bound)
+  → bursty mem traffic, low overlap
+
+  With POD-Attention:
+  SM0: prefill+decode mixed
+  SM1: prefill+decode mixed
+  SM2: prefill+decode mixed
+  → smoother memory pressure, shared KV in L2, ~29% speedup
+
+Key insight
+
+- Decouples HW CTA→SM assignment from SW CTA→role assignment
+- Hardware/software codesign to minimize data movement
+- Reuses KV in L2 across phases on the same SM
+
+GPU + CPU-GPU superchip improvements
+
+- Higher HBM bandwidth + bigger L2 = direct win for memory-bound decode
+- Grace Blackwell GB200 NVL72:
+  - 36 Grace CPUs + 72 Blackwell GPUs in one rack
+  - ~30 TB unified memory across CPU + GPU
+  - One logical "decode unit" can hold millions of tokens of KV
+- Memory tiers on NVL72:
+  - HBM (Blackwell GPU)     → active KV
+  - LPDDR5X (Grace CPU)     → cooler / older KV
+  - NVMe                    → cold context
+- Even on NVL72, prefill and KV offload still matter for million-token contexts
+
+Macro + micro must combine
+
+- Macro: disaggregation, routing, KV pool
+- Micro: FlashMLA / ThunderMLA / FlexDecoding, paged layouts, POD-Attention
+- Hardware: GB200-class memory bandwidth + capacity
+- All three layers together = real decode efficiency
+
+Fast KV cache transfer between prefill and decode
+
+Why transfer speed is critical
+
+- Prefill output = KV for all prompt tokens
+- Has to land on the decode worker before decode can run
+- Slow transfer → wipes out the parallelism gain of disaggregation
+- Target: a few ms, not hundreds
+
+KV size rough formula
+
+- KV size ≈ 2 × L × N × (h × d)
+  - L = layers, N = prompt tokens, h = heads, d = head_dim
+  - factor 2 = keys AND values
+- Example: L=40, h=16, d=64, N=1000 → ~40K KV vectors, hundreds of MB
+- N=5000 → 5× more (transfer cost grows linearly in tokens)
+
+Naive (bad) transfer path
+
+  prefill GPU → CPU memcpy → TCP socket → CPU on decode → GPU memcpy
+  → adds hundreds of ms for large prompts
+
+Recommended (fast) path
+
+  prefill GPU HBM ──── GPUDirect RDMA ────► decode GPU HBM
+  - no CPU bounce
+  - NIC reads/writes GPU memory directly (zero-copy)
+  - latency ~few ms even for big prompts
+
+Practical tip from the book
+
+- Collate small PagedAttention blocks into LARGER buffers before sending
+  - lots of tiny RDMA ops = high overhead
+  - one big op = bandwidth-dominated, latency-bounded
+- Send via GPUDirect RDMA, not CPU sockets
+
+Mnemonic: pack KV pages into contiguous buffers, ship via GPUDirect RDMA, colocate prefill+decode on the same SM (POD), and lean on NVL72 unified memory for the cold tail.

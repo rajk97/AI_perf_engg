@@ -338,3 +338,185 @@ Practical tip from the book
 - Send via GPUDirect RDMA, not CPU sockets
 
 Mnemonic: pack KV pages into contiguous buffers, ship via GPUDirect RDMA, colocate prefill+decode on the same SM (POD), and lean on NVL72 unified memory for the cold tail.
+
+5/21/26
+
+Zero-copy GPU-to-GPU KV transfer
+
+Core idea
+
+- Use RDMA over high-speed fabrics — no CPU bounce, no extra copies
+- Within a node: NVLink / NVSwitch
+- Across nodes: InfiniBand (or RoCE) via GPUDirect RDMA
+- Prefill GPU writes KV directly into decode GPU's HBM
+
+NVIDIA NIXL (NVIDIA Inference Xfer Library)
+
+- Plugin architecture for zero-copy data movement
+- Backends: NVLink, UCX fabrics, GPUDirect Storage
+- Used by NVIDIA Dynamo and vLLM + LMCache integration
+- Writes KV tensors directly into remote GPU memory
+
+Important: a full RDMA write still needs the data to LAND before decode can use it for that request
+
+- "Async" overlaps with OTHER ongoing decodes, not within the same request
+- New request's first token waits until its KV is fully landed
+- But that's only ~few ms over RDMA vs hundreds over CPU+TCP
+
+Five common transfer strategies
+
+  ┌─────────────────────┬───────────────────────────────────────────────┐
+  │ Strategy            │ How it works                                  │
+  ├─────────────────────┼───────────────────────────────────────────────┤
+  │ Prefill-side push   │ prefill RDMA-writes KV into decode buffer,    │
+  │                     │ then moves on to other work                   │
+  ├─────────────────────┼───────────────────────────────────────────────┤
+  │ Decode-side pull    │ decode RDMA-reads KV from prefill GPU when    │
+  │                     │ ready; receiver controls timing               │
+  ├─────────────────────┼───────────────────────────────────────────────┤
+  │ Shared-mem (IPC)    │ same host: CUDA IPC handle, NVLink/NVSwitch   │
+  │                     │ memcpy — zero-copy, no network                │
+  ├─────────────────────┼───────────────────────────────────────────────┤
+  │ Connector / queue   │ vLLM Pipe/LookupBuffer abstracts transport;   │
+  │                     │ swap RDMA, IPC, pub-sub (NATS for control)    │
+  ├─────────────────────┼───────────────────────────────────────────────┤
+  │ Nonblocking overlap │ KV write happens while decode keeps producing │
+  │                     │ tokens for OTHER requests                     │
+  └─────────────────────┴───────────────────────────────────────────────┘
+
+Visual: nonblocking overlap
+
+  decode GPU timeline:
+    [A tok][B tok][C tok][A tok][B tok][C tok][A tok]...
+                                                  ▲
+  RDMA in background: ──── D's KV streaming in ───┘
+  once D's KV lands → D joins the rotation
+    [A tok][B tok][C tok][D tok][A tok][B tok]...
+
+  → KV transfer ~5 ms is hidden behind active decode → near-zero added latency to other requests
+
+Why we package KV before sending
+
+- vLLM stores KV in 16-token PagedAttention blocks → many small pieces
+- Naively RDMA-ing each block:
+  - each transfer has fixed protocol overhead
+  - thousands of tiny ops → poor bandwidth utilization
+- Fix: collate small blocks into one big buffer → one (or few) RDMA ops
+- Bandwidth-bounded instead of latency-bounded
+
+Push vs pull tradeoff
+
+- Push: sender (prefill) decides when, frees prefill earlier, simpler producer
+- Pull: receiver (decode) decides when, can rate-limit incoming, smoother HBM use
+- Both achieve zero-copy; choice is design preference
+
+Why this works in the pipeline
+
+- Prefill compute: ~hundreds of ms (depends on prompt length)
+- KV transfer over RDMA: ~few ms
+- Decode start: nearly immediate after prefill finishes
+- Total parallelism preserved → goodput stays high
+
+Mnemonic: zero-copy = NIC/NVLink writes straight into decode HBM; package small KV pages into one big buffer; overlap the transfer with other requests' decoding so only the new request pays the (tiny) RDMA cost.
+
+KV page collation, LMCache + NIXL configuration, UCX tuning
+
+Page size matters for RDMA throughput
+
+- Engines support 8 / 16 / 32 / 64 / 128 token blocks
+- Bigger pages → bigger collated buffers → fewer Work Queue Elements (WQEs)
+- Sustained RDMA bandwidth needs LARGE transfers
+- Tip: collate ≥ 128-token pages per RDMA write
+- Use dedicated CUDA stream (nonblocking) + event fences
+- Always confirm overlap with Nsight Systems
+
+LMCache measured win
+
+- 7500-token KV transferred as 470 small ops → ~20 ms
+- Same KV collated into 128-token pages → ~8 ms
+- ~2.5× faster handoff, same hardware
+
+Visual: small vs large transfer
+
+  Many small ops:
+  |req|req|req|req|req|req|...|req|     ← 470 RDMA submits
+  per-op overhead dominates → 20 ms
+
+  Few large ops:
+  |══════════ one big op ══════════|     ← collated 128-token slabs
+  bandwidth-bound → 8 ms
+
+LMCache + NIXL config (sender side, prefill)
+
+  ┌──────────────────────────────────────────────┐
+  │ enable_pd: true                              │
+  │ transfer_channel: nixl                       │
+  │ pd_role: sender                              │
+  │ pd_proxy_host: decode-host                   │
+  │ pd_proxy_port: 7500                          │
+  │ pd_buffer_size: 1 GiB                        │
+  │ pd_buffer_device: cuda    ← stays in HBM     │
+  └──────────────────────────────────────────────┘
+
+LMCache + NIXL config (receiver side, decode)
+
+  ┌──────────────────────────────────────────────┐
+  │ enable_pd: true                              │
+  │ transfer_channel: nixl                       │
+  │ pd_role: receiver                            │
+  │ pd_peer_host: 0.0.0.0                        │
+  │ pd_peer_init_port: 7300  ← handshake/control │
+  │ pd_peer_alloc_port: 7400  ← data             │
+  │ pd_buffer_size: 1 GiB                        │
+  │ pd_buffer_device: cuda                       │
+  │ nixl_backends: [UCX]                         │
+  └──────────────────────────────────────────────┘
+
+Sizing the transfer buffer
+
+- Start at 1 GiB
+- ≈ FP16 KV for 4-8K tokens on 70B / 80 layers / 32 heads / d_head=128
+- For prompts > ~7.5K tokens → 2 GiB
+- Formula: bytes ≈ 2 × L × N × (H × Dh) × bytes_per_val
+- FP8 / FP4 KV → shrink buffer proportionally
+- Round to 256 MB boundary
+- Always validate against your largest collated page group
+
+Decode launch with UCX tuning
+
+  UCX_RNDV_THRESH=16384         ← large bufs use rendezvous, small use eager
+  UCX_MAX_EAGER_RAILS=1
+  UCX_TLS=cuda_ipc,rc,rdmacm,cuda_copy,cuda_ipc,tcp
+  CUDA_VISIBLE_DEVICES=1
+  LMCACHE_CONFIG_FILE=lmcache-decoder-config.yaml
+  python run_vllm_decoder.py --port 8200
+
+Transport selection rule
+
+- Single-node multi-GPU → enable CUDA IPC (NVLink/NVSwitch p2p)
+- Across nodes → prefer RDMA (RoCE/IB)
+- Typical UCX_TLS: rc, rdmacm, cuda_copy, cuda_ipc, tcp
+- For RoCE/IB: ensure lossless ECN/PFC on the fabric
+- Validate transports with `ucx_info -f`
+
+Eager vs rendezvous in UCX
+
+- Eager   = small messages, sent immediately (low setup overhead)
+- Rendezvous = large messages, handshake first, then RDMA bulk move
+- UCX_RNDV_THRESH sets the cutoff (here 16384 bytes)
+- Large KV buffers fall into rendezvous → efficient bandwidth use
+
+Deterministic hashing for KV routing
+
+- In multiprocess runs, Python's `hash()` is randomized per process
+- KV-chunk routing needs same key → same shard on every process
+- Fix: `export PYTHONHASHSEED=0`
+- Otherwise different workers see different "owners" for the same block → cache misses
+
+Why handoff speed matters (recap)
+
+- If KV transfer is slow, parallel PD pipeline collapses back to serial
+- Goal: keep handoff in single-digit to tens of ms
+- Combination of: RDMA + page collation + GPU-resident buffers + UCX tuning
+
+Mnemonic: collate pages to ≥128 tokens, keep buffers in HBM, prefer rendezvous over eager for big transfers, and PYTHONHASHSEED=0 so every process agrees on where each KV chunk lives.

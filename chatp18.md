@@ -731,3 +731,125 @@ Available parallelism dimensions to mix
 - SP (sequence): split sequence tokens across GPUs
 
 Mnemonic: prefill = PP or large TP for TTFT; decode = TP=1 (or small TP) for low TPOT; KV transpose bridges the layout mismatch between phases.
+
+Parallelism tables, mixed precision, and hybrid CPU-GPU prefill
+
+Example prefill parallelism (per-phase config)
+
+  ┌────────┬──────┬──────────────────────────────────────────────┐
+  │ Sym    │ Val  │ Why                                          │
+  ├────────┼──────┼──────────────────────────────────────────────┤
+  │ TP_p   │ 2    │ split weights across 2 GPUs → halve TTFT     │
+  │ PP_p   │ 2    │ 2 pipeline stages for deep models            │
+  │ SP_p   │ 1    │ no sequence sharding unless huge context     │
+  │ CP     │ 1    │ keep whole context on one GPU                │
+  │ DP_p   │ 1 (or 2) │ 1 replica/GPU; 2 doubles batched prompts │
+  └────────┴──────┴──────────────────────────────────────────────┘
+
+Example decode parallelism
+
+  ┌────────┬───────────────┬─────────────────────────────────────────┐
+  │ Sym    │ Val           │ Why                                     │
+  ├────────┼───────────────┼─────────────────────────────────────────┤
+  │ TP_d   │ 1 (default)   │ minimal sync overhead                   │
+  │        │ N (max)       │ helps tiny GEMMs / model too big for 1  │
+  │ PP_d   │ 1             │ avoid pipeline bubbles per token        │
+  │ SP_d   │ 1             │ keep stream local unless huge output    │
+  │ DP_d   │ 1             │ replicas handle parallel REQUESTS, not  │
+  │        │               │ a single stream                         │
+  └────────┴───────────────┴─────────────────────────────────────────┘
+
+- If model can't fit on one B200 → use TP_d = 2 or 4, NOT PP (no bubbles)
+
+Decode parallelism intuition
+
+- 1 decode stream wants 1 GPU (lowest comm overhead)
+- TP_d > 1 only when:
+  - model too big for 1 GPU
+  - GEMMs are tiny enough that comm hides under compute
+- DP across requests = throughput; not for a single stream
+
+Mixed precision per phase
+
+- Prefill: FP8 / INT8 / FP4 → faster compute, smaller KV
+- Decode: same precision OR higher for output quality
+- Catch: KV layout/precision must match decode expectations
+- Fix: convert KV during transfer (same idea as TP transpose)
+  - quantize before send, dequant on receive
+  - or send low-precision over network → less BW used
+- Lets you tune precision per phase independently
+
+Hybrid prefill with CPU-GPU collaboration
+
+Why CPUs come into play
+
+- Capacity, not speed:
+  - CPU DDR/LPDDR5X = hundreds of GB to TBs
+  - GPU HBM = 80-288 GB
+- CPUs do NOT replace GPU compute — way slower for matmuls
+- They serve as a tier for cold KV / huge prompts / preprocessing
+
+Memory tier visual
+
+  ┌──────────────────────────────────────────────────────────────────┐
+  │ tier      │ size       │ bandwidth     │ role                    │
+  ├──────────────────────────────────────────────────────────────────┤
+  │ HBM (GPU) │ 80-288 GB  │ 3-8 TB/s      │ active KV, matmul       │
+  │ CPU DDR/  │ 0.5-6 TB   │ 300-500 GB/s  │ cold KV, long prompts,  │
+  │ LPDDR5X   │            │               │ preprocess              │
+  │ NVMe      │ TBs+       │ GB/s          │ long-term cold storage  │
+  └──────────────────────────────────────────────────────────────────┘
+
+When to offload prefill to a CPU
+
+- Ultralong prompts (10K+ tokens) that don't fit on GPU
+- Offline / batch / low-priority jobs
+- Background work that mustn't tie up interactive GPUs
+- Burst overflow when GPUs are saturated (graceful degradation)
+
+Grace Blackwell (and similar superchips)
+
+- Fast CPU-GPU interconnect (NVLink-C2C)
+- CPU handles huge memory + initial preprocessing
+- GPU handles dense attention
+- Can spill KV to CPU DDR with low-ish overhead
+- Effectively extends usable context length
+
+Layer-partition pattern (rare, complex)
+
+  prompt
+     ↓
+  GPU runs first N layers (compress sequence)
+     ↓
+  CPU runs middle M layers (lots of memory available)
+     ↓
+  GPU runs final layers (dense attention, generate KV)
+
+- Trade-off: heavy orchestration + data movement
+- Only worth it for extreme contexts / severe HBM limits
+
+Third worker type in the system
+
+- Now 3 prefill options the router picks from:
+  - GPU prefill worker (fast, normal path)
+  - CPU prefill worker (slow, big-memory, offline)
+  - Local prefill on the decode GPU (when offload doesn't pay)
+- Policy example: prompt_length > 5000 → CPU prefill worker
+
+Things to watch
+
+- CPU offload raises TTFT — not for interactive paths
+- Monitor frequency of CPU-offload events
+  - frequent use → you actually need more GPU capacity
+- "Fail fast" if CPU path would blow SLO anyway
+
+Cost angle
+
+- CPU hours << GPU hours
+- Hybrid clusters (GPU + CPU instances) cut $ for:
+  - tokenization, padding, preprocessing
+  - small-model / non-LLM inference
+  - large offline prompts
+
+Mnemonic: CPUs aren't faster — they're roomier. Use HBM for hot KV and matmuls, CPU DDR/LPDDR5X for cold KV and ultralong prompts, and let a third worker type handle the slow-but-cheap path.
+

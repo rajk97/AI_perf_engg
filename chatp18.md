@@ -520,3 +520,119 @@ Why handoff speed matters (recap)
 - Combination of: RDMA + page collation + GPU-resident buffers + UCX tuning
 
 Mnemonic: collate pages to ≥128 tokens, keep buffers in HBM, prefer rendezvous over eager for big transfers, and PYTHONHASHSEED=0 so every process agrees on where each KV chunk lives.
+
+Connector design, fault handling, and heterogeneous hardware
+
+Two coordination patterns
+
+  ┌──────────────────┬─────────────────────────────────────────────────┐
+  │ Pattern          │ How it works                                    │
+  ├──────────────────┼─────────────────────────────────────────────────┤
+  │ Global queue     │ decode pushes prompt tasks into a central queue │
+  │ (NVIDIA Dynamo)  │ prefill workers pull from it                    │
+  │                  │ each task carries reply-to id of the decode     │
+  │                  │ prefill returns KV via NIXL RDMA                │
+  ├──────────────────┼─────────────────────────────────────────────────┤
+  │ Per-request      │ decode + prefill open a direct channel for      │
+  │ direct channel   │ each request (TCP or RDMA negotiated at start)  │
+  │ (vLLM+LMCache)   │ no shared queue                                 │
+  └──────────────────┴─────────────────────────────────────────────────┘
+
+Trade-offs
+
+- Global queue:
+  - simpler load balancing
+  - easier failover
+  - small queueing delay
+  - good fit: multitenant, robust ops
+- Direct channel:
+  - fewer hops, less jitter
+  - shines under stable PD pairs + fast fabric
+  - good fit: strict tail-latency SLOs
+- Recommendation: benchmark both under your actual prompt mix, concurrency, and failure scenarios
+
+Pipeline must be nonblocking
+
+- At any moment:
+  - request A is decoding
+  - request B's prompt is prefilling
+  - request C's KV is in flight (RDMA)
+- No stage idle while work exists elsewhere
+- This is the whole point of disaggregation — parallel stages
+
+Visual
+
+  Stage    | t=0     t=1     t=2     t=3
+  ─────────┼──────────────────────────────────
+  prefill  | promptB promptC promptD ...
+  KV xfer  |  →B?    →C?     →D?    ...
+  decode   | tokenA  tokenA  tokenA tokenA  (B/C/D join as their KV lands)
+
+About the first token
+
+- Prefill DOES produce logits for the first token
+- Often NOT transferred — decode worker can recompute from the KV cheaply
+- Some systems do transfer it to save a few hundred μs
+- Trade-off: simplicity vs micro-optimization
+
+Robustness to failures
+
+- Decode crash mid-gen → global KV pool lets another node resume
+- Prefill crash mid-prompt → retry the prompt elsewhere
+- Router uses heartbeats + timeouts on PD transfers
+  - stalled transfer → reassign or abort cleanly
+- One node failure should NOT fail the whole request
+
+Heterogeneous hardware per phase
+
+- Disaggregation lets each phase pick optimal HW + parallelism
+- Monolithic deployments must use one type for both → compromise
+
+Phase needs
+
+  ┌──────────┬─────────────────────────────────────────────────────┐
+  │ Phase    │ Wants                                               │
+  ├──────────┼─────────────────────────────────────────────────────┤
+  │ Prefill  │ high TFLOPS, fresh Tensor Cores, fast clocks        │
+  │          │ moderate HBM (just for prompt KV)                   │
+  ├──────────┼─────────────────────────────────────────────────────┤
+  │ Decode   │ huge HBM capacity + bandwidth                       │
+  │          │ doesn't need top-end compute                        │
+  └──────────┴─────────────────────────────────────────────────────┘
+
+Pairing example (Splitwise study)
+
+- prefill: 4× H100   (compute-heavy)
+- decode:  4× A100   (memory-heavy, cheaper)
+- result vs homogeneous 8-GPU baseline:
+  - 1.4× throughput at 20% lower cost (one config)
+  - 2.35× throughput at same cost/power (other config)
+- Alternative: match baseline throughput with fewer GPUs (5-6 vs 8)
+- KV transfer across mixed GPUs goes over NVSwitch — minimal overhead
+
+Visual: cost/throughput shift
+
+  Homogeneous:
+  [H100][H100][H100][H100][H100][H100][H100][H100]   8× expensive
+
+  Heterogeneous (mixed-gen):
+  [H100][H100][H100][H100] prefill (compute-bound)
+  [A100][A100][A100][A100] decode  (memory-bound)
+  → 2.35× RPS at same $ / W
+
+Rule of thumb
+
+- Compute-bound work → highest compute/$ GPU (Blackwell / Rubin)
+- Memory-bound work → cost-efficient older GPUs with enough HBM BW (Hopper / Ampere)
+- High-bandwidth interconnect (NVLink/NVSwitch) makes mixed setups viable
+
+HexGen-2
+
+- Distributed inference framework
+- Treats heterogeneous-GPU allocation as an optimization problem
+- Co-optimizes:
+  - resource allocation (which GPU does what)
+  - per-phase parallelism strategy (TP/PP/DP)
+  - communication efficiency (placement vs interconnect)
+
+Mnemonic: pick the connector pattern (queue vs direct channel) to match your SLOs, keep the pipeline busy in all three stages at once, and use cheap memory-rich GPUs for decode while saving the expensive compute-rich GPUs for prefill.

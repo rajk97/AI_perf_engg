@@ -636,3 +636,98 @@ HexGen-2
   - communication efficiency (placement vs interconnect)
 
 Mnemonic: pick the connector pattern (queue vs direct channel) to match your SLOs, keep the pipeline busy in all three stages at once, and use cheap memory-rich GPUs for decode while saving the expensive compute-rich GPUs for prefill.
+
+HexGen-2 results and phase-specific model parallelism
+
+HexGen-2 results
+
+- Llama 2 70B on mixed GPUs:
+  - up to 2× serving throughput (~1.3× avg) vs SOTA at same price
+  - matches high-end baseline with ~30% lower cost
+- Effectively automates what Splitwise did by hand
+- Disaggregation isn't just speed — it's $/query and W/query
+
+Cost intuition
+
+- Same traffic with 6 mixed GPUs instead of 8 top-tier GPUs → ~25% hardware cost cut
+- Power efficiency: decode on lower-power GPUs (slight speed hit, big watts saved)
+- Big deal when supply of newest GPUs is limited
+
+Trade-offs of heterogeneity
+
+- More system complexity (manage multiple GPU types)
+- Less flexibility to reshuffle GPUs across phases dynamically
+- Usually worth it for cost-sensitive deployments
+
+Phase-specific model parallelism (why)
+
+- Optimal parallelism for prefill ≠ optimal for decode
+- Disaggregation lets you choose them independently
+
+Prefill characteristics
+
+- One big forward pass over N prompt tokens
+- Compute-bound, amortizes comm overhead over many tokens
+- TP works (big matmuls split across GPUs)
+- PP also works (stream prompt through layer stages)
+- Goal: minimize TTFT
+
+Decode characteristics
+
+- Tiny per-token forward passes
+- Latency-sensitive (TPOT / ITL)
+- More GPUs per request can HURT due to comm overhead
+- TP=1 (single GPU) often best per request
+- DP across requests gives throughput
+
+Common phase-specific config
+
+  ┌──────────┬────────────────────────────────────────────────┐
+  │ Phase    │ Parallelism                                    │
+  ├──────────┼────────────────────────────────────────────────┤
+  │ Prefill  │ PP=4 (or TP=8) — minimize TTFT                 │
+  │ Decode   │ TP=1 — minimize per-token latency              │
+  └──────────┴────────────────────────────────────────────────┘
+
+- Note: TP on prefill adds all-reduce overhead during prompt processing
+- PP avoids that for prefill; TP wins inside small decode steps
+
+KV layout mismatch problem
+
+- Prefill TP=1 (uses PP) on 4 GPUs → each prefill GPU holds full-size KV for its layers
+- Decode TP=4 → each decode GPU expects 1/4 of KV sliced along hidden dim
+- Layouts don't match between phases
+
+Visual: layout mismatch
+
+  Prefill side (PP=4, TP=1):
+    GPU0: KV for layers 0-9    (full hidden dim)
+    GPU1: KV for layers 10-19  (full hidden dim)
+    GPU2: KV for layers 20-29  (full hidden dim)
+    GPU3: KV for layers 30-39  (full hidden dim)
+
+  Decode side (TP=4, one stage):
+    GPU0: KV for all layers, hidden dim slice [0..H/4]
+    GPU1: KV for all layers, hidden dim slice [H/4..H/2]
+    GPU2: KV for all layers, hidden dim slice [H/2..3H/4]
+    GPU3: KV for all layers, hidden dim slice [3H/4..H]
+
+  → need to reshape KV: split by layer ↔ split by head
+
+NVIDIA Dynamo's KV transpose
+
+- High-perf on-the-fly KV transpose kernel
+- Runs AFTER NIXL read, BEFORE writing into decode HBM
+- Converts [TP_p parts] → [TP_d parts]
+- Cost is small compared to network transfer
+- NVLink BW absorbs the reorg easily
+- Trade: tiny transpose cost vs big phase-specific perf wins
+
+Available parallelism dimensions to mix
+
+- TP (tensor): split matmul across GPUs
+- PP (pipeline): split layers across GPUs
+- DP (data): replicate model, split requests
+- SP (sequence): split sequence tokens across GPUs
+
+Mnemonic: prefill = PP or large TP for TTFT; decode = TP=1 (or small TP) for low TPOT; KV transpose bridges the layout mismatch between phases.

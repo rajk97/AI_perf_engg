@@ -853,3 +853,147 @@ Cost angle
 
 Mnemonic: CPUs aren't faster — they're roomier. Use HBM for hot KV and matmuls, CPU DDR/LPDDR5X for cold KV and ultralong prompts, and let a third worker type handle the slow-but-cheap path.
 
+6/1/26
+
+SLO-aware request management and fault tolerance
+
+Why SLO-aware serving needs more than scaling
+
+- Scaling + scheduling improve capacity, but they cannot save every request during overload
+- If accepting a request will likely miss TTFT / TPOT targets, reject or defer it early
+- Goal: maximize goodput, not raw accepted-request count
+
+Visual
+
+  Bad overload behavior:
+    accept everything → queues grow → many requests time out → low goodput
+
+  SLO-aware behavior:
+    admit only feasible work → reject/defer excess → accepted requests meet SLO
+
+Early rejection / admission control
+
+- Admission control = decide at request arrival whether the system can serve it within the latency target
+- Prediction can use:
+  - current queue length
+  - recent throughput
+  - prefill utilization
+  - decode utilization
+  - estimated prompt length + output length
+  - lightweight latency model
+- If predicted latency > SLO → return fast "too busy / retry later" instead of silently missing the deadline
+- This is like HTTP 503 load shedding: painful, but better than timing out everyone
+
+Mooncake-style example
+
+- Router estimates pressure on BOTH prefill and decode clusters
+- Long prompt → mainly stresses prefill
+- Long expected generation → mainly stresses decode
+- If decode cluster is already saturated with long sequences, a new long-output request is rejected/deferred
+- This avoids wasting GPU compute + HBM bandwidth on a request that would miss its SLO anyway
+
+Visual: admission gate
+
+  new request
+      ↓
+  estimate prefill load + decode load + expected length
+      ↓
+  ┌───────────────────────────────┐
+  │ would TTFT / TPOT stay in SLO? │
+  └───────────────┬───────────────┘
+          yes ────┴──── no
+          ↓             ↓
+       admit       reject / defer / retry later
+
+Goodput intuition
+
+- Throughput = how much work system attempts
+- Goodput = how much work finishes within SLO
+- Under overload, accepting fewer requests can increase goodput
+- Reason: queues stay short, tail latency stays bounded, GPU memory bandwidth is not wasted on doomed requests
+
+Quality of Service (QoS)
+
+- QoS = not all requests are treated equally
+- Examples:
+  - premium users > free users
+  - interactive chat > offline batch
+  - short latency-sensitive requests > long best-effort jobs
+- Scheduler can reserve capacity by tier:
+  - premium: 10%
+  - standard: 30%
+  - free: 60%
+- Higher-priority requests get headroom even when lower-priority traffic spikes
+
+Visual: tiered capacity
+
+  total cluster capacity
+  ┌──────────┬────────────────────────────┬──────────────────────────────┐
+  │ premium  │ standard                   │ free                         │
+  │ 10%      │ 30%                        │ 60%                          │
+  └──────────┴────────────────────────────┴──────────────────────────────┘
+     protected  protected                    best-effort / easiest to shed
+
+QoS actions when latency approaches SLO
+
+- scale out if capacity can arrive fast enough
+- reject new low-priority requests
+- defer batch/offline work
+- cap max output length for long generations
+- route high-priority traffic to reserved workers
+- shed load with circuit breakers before p99 / p99.9 explodes
+
+Disaggregation helps diagnosis
+
+- Separate prefill queue + decode queue reveal the real bottleneck
+- Prefill backed up → stop accepting huge prompts or add prefill workers
+- Decode saturated → limit long-output / reasoning requests or add decode workers
+- This is better than one generic "GPU busy" signal
+
+Visual: bottleneck-specific response
+
+  prefill queue high → prompt admission ↓ / prefill scale ↑
+  decode queue high  → max output ↓ / decode scale ↑ / long gens rejected
+
+Fault tolerance in disaggregated inference
+
+- Main failure question: what happens if a worker dies mid-request?
+- If KV cache is in a shared pool, another decode worker can resume generation from saved KV
+- If KV is not saved, system must rerun prefill on another node, then continue decode
+- KV snapshots trade extra memory/copy overhead for faster recovery
+
+Failure recovery cases
+
+  ┌──────────────────────┬──────────────────────────────────────────────┐
+  │ Failure              │ Recovery                                      │
+  ├──────────────────────┼──────────────────────────────────────────────┤
+  │ decode node dies     │ reload KV from pool, continue on new decoder  │
+  │ prefill node dies    │ retry prefill elsewhere                       │
+  │ KV missing           │ recompute prefill, then decode                │
+  │ transfer stalls      │ timeout, reassign, or abort cleanly           │
+  └──────────────────────┴──────────────────────────────────────────────┘
+
+Why periodic KV checkpointing matters
+
+- KV cache is the expensive state created by prefill
+- Saving it periodically means failures lose fewer tokens / less compute
+- This is useful even without strict prefill-decode disaggregation
+- vLLM-like systems can checkpoint/copy KV to a pool to protect against worker loss
+
+Process-level checkpointing
+
+- `cuda-checkpoint` + CRIU can snapshot a Linux GPU worker process
+- Restore works best onto another node with the same GPU chip type
+- Useful for preemption, failure recovery, and reducing cold-start cost
+- Prewarmed checkpoint restore can avoid reloading weights + recompiling CUDA graphs from scratch
+
+Cold-start intuition
+
+  normal start:
+    load weights → allocate GPU memory → compile/capture graphs → warm caches → serve
+
+  checkpoint restore:
+    restore prewarmed process/GPU state → serve sooner
+
+Mnemonic: SLO serving is a nightclub bouncer plus an ambulance — admission control keeps overload out, QoS lets VIP traffic through, and KV/process checkpoints recover when workers crash.
+

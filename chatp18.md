@@ -997,3 +997,103 @@ Cold-start intuition
 
 Mnemonic: SLO serving is a nightclub bouncer plus an ambulance — admission control keeps overload out, QoS lets VIP traffic through, and KV/process checkpoints recover when workers crash.
 
+Dynamic scheduling and load balancing
+
+Why static prefill/decode splits fail
+
+- Workload mix changes over time
+- Long prompts + short answers → prefill-heavy
+- Short prompts + long reasoning answers → decode-heavy
+- A fixed `X_p : Y_d` worker ratio becomes wrong as traffic shifts
+- Goal: keep both phases near capacity WITHOUT growing queues
+
+Visual: changing bottleneck
+
+  summarization hour:
+    long input  → heavy prefill  → need more prefill workers
+    short output → light decode
+
+  reasoning hour:
+    short input → light prefill
+    long output → heavy decode → need more decode workers
+
+Static misconfiguration patterns
+
+  ┌──────────────────────────────┬──────────────────────────────────────────┐
+  │ Misconfiguration             │ Symptom                                  │
+  ├──────────────────────────────┼──────────────────────────────────────────┤
+  │ too few decode workers       │ TPOT rises; decode queue grows           │
+  │ too few prefill workers      │ TTFT rises; requests wait to start       │
+  │ overprovisioned one side     │ expensive GPUs idle on the other phase   │
+  │ balanced for old workload    │ breaks when prompt/output mix changes    │
+  └──────────────────────────────┴──────────────────────────────────────────┘
+
+Adaptive scheduling core idea
+
+- Continuously observe prefill queue, decode queue, GPU utilization, and latency
+- Predict where bottlenecks will form before queues explode
+- Route requests to less-loaded workers
+- Repurpose capacity between prefill and decode when possible
+- Combine with autoscaling, admission control, and QoS shedding
+
+Visual: feedback loop
+
+  metrics → predict bottleneck → adjust routing / worker split → measure again
+     ↑                                                        ↓
+     └──────────────────── closed-loop scheduler ────────────┘
+
+Good target operating regime
+
+- Prefill busy but not overloaded
+- Decode busy but not overloaded
+- TTFT stable
+- TPOT stable
+- No single node becomes a hotspot
+- Accepted requests meet SLO; excess load is rejected/deferred early
+
+TetriInfer two-level scheduler
+
+- Level 1: request-level routing
+  - assigns each request to specific prefill + decode instances based on current load
+  - normal per-request placement decision
+- Level 2: cluster-level hotspot prevention
+  - monitors queue lengths, GPU utilization trends, and predicted resource usage
+  - proactively shifts work away from nodes likely to become overloaded
+
+TetriInfer intuition
+
+- Name hints at packing requests like Tetris pieces
+- Different requests have different prompt lengths, output lengths, and resource shapes
+- Scheduler tries to fit these shapes into available GPU time without interference
+- This smooths load across the cluster instead of letting one node become the long-sequence graveyard
+
+Visual: hotspot prevention
+
+  naive routing:
+    decode0: [long][long][long][long]  → hotspot, TPOT spike
+    decode1: [short]                   → underused
+    decode2: [short][short]            → underused
+
+  TetriInfer-style routing:
+    decode0: [long][short]
+    decode1: [long][short]
+    decode2: [long][short]
+    → smoother queues, better p99 latency
+
+How this connects to SLO-aware control
+
+- Admission control decides whether to accept work
+- QoS decides which work matters most
+- Dynamic scheduling decides where accepted work should go
+- Fault tolerance makes sure failures do not drop the request
+- Together: stable service under overload, traffic shifts, and node failures
+
+First-principles summary
+
+- Prefill and decode are two different factories
+- If one factory is backed up while the other is idle, global throughput suffers
+- Dynamic scheduling is the dispatcher that keeps both factories fed at the right rate
+- SLO-aware admission is the gate that prevents the dispatcher from accepting impossible work
+
+Mnemonic: static splits are brittle; dynamic schedulers watch queues, pack requests like Tetris, and move work before hotspots become SLO misses.
+

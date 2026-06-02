@@ -1097,3 +1097,116 @@ First-principles summary
 
 Mnemonic: static splits are brittle; dynamic schedulers watch queues, pack requests like Tetris, and move work before hotspots become SLO misses.
 
+Arrow, Mooncake, and dynamic resource scaling
+
+Why fixed PD ratios fail
+
+- Workload mix shifts during the day
+  - input-heavy (summaries, RAG) → prefill bottleneck
+  - output-heavy (reasoning, long answers) → decode bottleneck
+- Static # of prefill vs decode workers → temporary goodput loss
+- One side idles while the other piles up queue
+
+Arrow — adaptive instance scaling
+
+- Continuously measures:
+  - input token rate vs output token rate
+  - backlog per worker pool
+  - TTFT / TPOT percentiles
+- Then BOTH:
+  - reschedules requests (where to send next request)
+  - rescales instances (how many prefill vs decode workers)
+- Treats # of prefill / # of decode as a tunable parameter
+- Result: up to 5.6× higher RPS vs nonadaptive in highly shifting workloads
+
+Two scaling situations
+
+  ┌────────────────────────┬─────────────────────────────────────┐
+  │ Detected condition     │ Arrow action                        │
+  ├────────────────────────┼─────────────────────────────────────┤
+  │ prefill queue growing  │ convert decode → prefill            │
+  │ TTFT rising            │ or launch new prefill instances     │
+  ├────────────────────────┼─────────────────────────────────────┤
+  │ decode queue growing   │ shift prefill → decode              │
+  │ TPOT rising            │ or launch new decode instances      │
+  └────────────────────────┴─────────────────────────────────────┘
+
+Visual
+
+  Workload shifts → input-heavy
+  ┌─────────────────────────┐
+  │ prefill: ▇▇▇▇▇▇▇▇ busy  │  ← bottleneck
+  │ decode:  ▇▇▇    idle    │
+  └─────────────────────────┘
+              ↓ Arrow
+  ┌─────────────────────────┐
+  │ prefill: ▇▇▇▇▇▇▇▇       │  more workers here
+  │ decode:  ▇▇             │  fewer workers
+  └─────────────────────────┘
+
+Role-flip mechanics
+
+- On-prem (fixed GPUs): instruct a GPU to switch roles
+  - overhead: may need to load different sharded weights / quant
+  - some designs keep all weights loaded → just route different tasks
+- Cloud: trigger Kubernetes HPA / Cluster Autoscaler to add/remove pods
+- New pods take tens of seconds → may need load-shedding in the gap
+
+Mooncake — supply-side scaling's demand-side twin
+
+- While Arrow scales SUPPLY (more/less workers), Mooncake manages DEMAND
+- Predictive early rejection (admission control):
+  - if predicted that SLO can't be met → reject before accepting
+  - prevents overload cascades
+- Two sides of one coin:
+  - supply-side: spin up / reallocate workers (Arrow)
+  - demand-side: throttle / reject low-prio (Mooncake)
+
+Dynamic resource scaling techniques
+
+- Elastic instances (k8s HPA-style)
+  - rule: keep prefill GPU util ≈ 70%
+  - exceed → add a pod; under → move pod to decode
+- Instance "flip" (TetriInfer)
+  - nodes can switch roles
+  - needs weights / sharding / quant compatible with both roles
+- Statelessness for elasticity (Arrow)
+  - workers don't keep long-lived session state
+  - free to reassign
+  - mid-decode is sticky though — wait for it to finish before flipping
+- Anti-oscillation guards
+  - min residency time per role
+  - hysteresis on thresholds
+  - prevents thrashing/flapping between roles
+
+Predictive scheduling
+
+- ARIMA-style forecasting on traffic patterns
+- e.g. "long-output spike every night at 9pm" → preallocate decode capacity
+- Reduces lag between workload shift and resource shift
+- Combine reactive + predictive for best stability
+
+Metrics to feed the controller
+
+- Prefill queue length, decode queue length
+- TTFT p50/p95/p99
+- TPOT (ITL) p50/p95/p99
+- Per-pool GPU util + HBM util
+- Usually exported via Prometheus + custom k8s controllers
+
+Multitenant / mixed-workload reuse
+
+- Disaggregation modularity lets idle decode GPUs run
+  a different smaller model temporarily
+- Not mainstream yet, but architecturally feasible
+
+Layered insight
+
+  ┌─────────────────────────────────────────────────────────┐
+  │ disaggregation        removes PHASE INTERFERENCE        │
+  │ adaptive disaggregation removes PHASE IMBALANCE         │
+  │ admission control     removes SLO VIOLATION CASCADES    │
+  └─────────────────────────────────────────────────────────┘
+
+Mnemonic: Arrow scales the supply (flip GPUs and add pods), Mooncake throttles the demand (reject early), forecasting preallocates for known peaks — and anti-oscillation guards stop everything from thrashing.
+

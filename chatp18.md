@@ -1210,3 +1210,64 @@ Layered insight
 
 Mnemonic: Arrow scales the supply (flip GPUs and add pods), Mooncake throttles the demand (reject early), forecasting preallocates for known peaks — and anti-oscillation guards stop everything from thrashing.
 
+Chapter 18 wrap-up
+
+Key takeaways
+
+  ┌──────────────────────────────┬──────────────────────────────────────────┐
+  │ Theme                        │ What to do                               │
+  ├──────────────────────────────┼──────────────────────────────────────────┤
+  │ Accelerate decode            │ use FlashMLA, ThunderMLA, FlexDecoding   │
+  │                              │ to raise token throughput + GPU util     │
+  ├──────────────────────────────┼──────────────────────────────────────────┤
+  │ Treat KV as first-class      │ share KV across GPUs, reuse prefixes,    │
+  │                              │ use global pools + hashing               │
+  ├──────────────────────────────┼──────────────────────────────────────────┤
+  │ Minimize PD handoff          │ GPUDirect RDMA + NIXL + overlap compute  │
+  │                              │ and transfer for near-zero overhead      │
+  ├──────────────────────────────┼──────────────────────────────────────────┤
+  │ Specialize each phase        │ compute-heavy HW/parallelism for prefill │
+  │                              │ memory-rich / small-TP for decode        │
+  ├──────────────────────────────┼──────────────────────────────────────────┤
+  │ Stay adaptive                │ dynamic scaling + early rejection + SLO  │
+  │                              │ awareness to avoid overload              │
+  └──────────────────────────────┴──────────────────────────────────────────┘
+
+Short version
+
+- Decode speed comes from fused kernels and careful KV layout
+- KV cache is not scratch space anymore; it is a shared system resource
+- Prefill→decode handoff must be GPU-to-GPU, collated, and overlapped
+- Best hardware / precision / parallelism often differs by phase
+- Static splits are not enough; schedulers must react to load and SLOs
+
+Conclusion
+
+- Ultrascale inference needs BOTH:
+  - low-level kernel + memory tuning
+  - high-level adaptive scheduling + routing
+- These optimizations compound:
+  - faster kernels lower TPOT
+  - better KV handling lowers recompute + transfer cost
+  - adaptive scaling keeps prefill/decode balanced
+  - SLO-aware control prevents overload cascades
+- As hardware gets more memory, more bandwidth, and better inference kernels
+  - these gains stack rather than compete
+- End goal: maximum throughput on modern hardware while still meeting strict latency guarantees
+
+Visual
+
+  kernel fusion
+       +
+  KV pooling / reuse
+       +
+  zero-copy PD transfer
+       +
+  phase-specific HW / parallelism
+       +
+  adaptive scaling + SLO control
+       ↓
+  high goodput under latency constraints
+
+Mnemonic: chapter 18 says fast serving is multiplicative, not additive — fuse decode, treat KV like shared infrastructure, hand off over RDMA, specialize each phase, and let the scheduler keep the whole machine in balance.
+

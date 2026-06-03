@@ -167,3 +167,135 @@ Why this beats one-size-fits-all
 - Static configs cannot do this well across changing workloads
 
 Mnemonic: don't reshuffle a huge model live; prebuild multiple sharded pools, then send long memory-hungry requests to TP+PP and short latency-sensitive ones to TP-only.
+
+Dynamic precision changes
+
+Why do this at runtime
+
+- Blackwell-class GPUs support FP8 / FP4 Tensor Core math
+- Lower precision gives:
+	- more throughput
+	- less memory use
+	- usually small quality loss if chosen carefully
+- Goal: run at the LOWEST precision that still preserves output quality
+
+What triggers precision changes
+
+- Model confidence
+	- sharp / peaky next-token distribution → low precision is usually safe
+	- flat / uncertain distribution → stay in higher precision
+- Memory pressure
+	- KV cache near full → compress activations / KV more aggressively
+
+Confidence-based switching
+
+- Measure output confidence from the token distribution
+- Book examples:
+	- Shannon entropy of softmax
+	- max softmax probability
+	- top1-top2 logit margin
+- Low entropy / high margin = confident
+- High entropy / low margin = uncertain
+
+Practical rule
+
+- deterministic continuation (quotes, lists, boilerplate)
+	→ FP4 / FP8 often safe
+- ambiguous reasoning branch
+	→ FP8 / BF16 / FP16 safer
+
+Visual
+
+	confidence high   → drop precision → faster
+	confidence low    → raise precision → safer
+
+Memory-pressure switching
+
+- If KV cache reaches ~90% memory usage
+	- quantize new KV entries INT8 → INT4
+	- or retroactively compress older entries
+- Cuts KV memory by ~50% for those entries
+- Risk: quantization error can accumulate across many decode steps
+- So quality should be rechecked periodically
+
+Precision tradeoff table
+
+	┌──────────────────────────────┬──────────────┬──────────────┬─────────────────────────┐
+	│ Mode                         │ Memory       │ Throughput   │ Quality impact          │
+	├──────────────────────────────┼──────────────┼──────────────┼─────────────────────────┤
+	│ FP16 baseline                │ 1.0×         │ 1.0×         │ none                    │
+	│ FP16 weights + FP8 acts      │ ~0.5×        │ ~1.5×        │ negligible (<0.1%)      │
+	│ INT4 weights + FP8 acts      │ ~0.25×       │ ~1.8×        │ ~0.5% drop              │
+	│ INT4 weights + FP4 acts      │ ~0.2×        │ ~3.5×        │ ~1% drop, tune carefully│
+	└──────────────────────────────┴──────────────┴──────────────┴─────────────────────────┘
+
+- FP8 often gives near-free savings
+- FP4 gives bigger gains but needs careful per-layer validation
+
+Recommended software stack
+
+- PyTorch AMP (`torch.autocast`) manages BF16 / FP16 only
+- AMP does NOT manage FP8 / FP4 automatically
+- For FP8/FP4 on NVIDIA GPUs, use Transformer Engine (TE)
+- Blackwell guidance:
+	- latency-critical decode via AMP → prefer BF16 over FP16
+	- FP8 path → use Transformer Engine MXFP8
+	- FP4 path → use NVFP4 selectively, especially KV / light layers
+
+Layer-wise precision control
+
+- Not every layer needs same precision
+- Example strategy:
+	- early / sensitive layers → FP8 or BF16/FP16
+	- lighter / tolerant layers → FP4
+- Runtime hooks can raise or lower layer precision on demand
+
+Token-wise precision control
+
+- Even finer: decide precision per decode step
+- Typical loop:
+	1. run current token in default precision
+	2. compute confidence signal on device
+	3. every N steps, reevaluate precision choice
+	4. if confidence sustained high → enter FP8
+	5. if confidence drops → exit FP8 back to BF16/FP16
+
+Why the example uses hysteresis
+
+- Enter threshold > exit threshold
+- Prevents "precision flapping" every step
+- EMA smoothing + reevaluation interval reduce host-device sync overhead
+
+Example threshold idea
+
+- enter FP8 when confidence > 6.0
+- exit FP8 when confidence < 3.0
+- Must be calibrated on a validation set for your prompts + model
+
+What the sample code is really doing
+
+- Uses exactly one precision context per step
+- If TE is present and confidence is high → FP8 path
+- Otherwise → AMP BF16 / FP16 path
+- Confidence metric stays on device, host checks only periodically
+- Result: elastic precision without syncing CPU every token
+
+Why this works
+
+- Low-entropy stretches run faster in low precision
+- High-entropy stretches recover quality with higher precision
+- Best of both: high throughput plus bounded quality loss
+
+Kernel autotuning lead-in
+
+- Precision is only one runtime knob
+- Next knob: kernel choice itself
+- Attention / MLP speed depends on:
+	- tile size
+	- block size
+	- loop unrolling
+	- memory access pattern
+- Static heuristics are not enough when batch size / sequence length vary per request
+- Runtime kernel autotuning picks or JIT-compiles the best kernel for the current shape
+
+Mnemonic: use FP4/FP8 only when the model is confident or memory is tight, fall back to BF16/FP16 when uncertainty rises, and smooth the switch with hysteresis so precision adapts without flapping.

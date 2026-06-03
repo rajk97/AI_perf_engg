@@ -299,3 +299,130 @@ Kernel autotuning lead-in
 - Runtime kernel autotuning picks or JIT-compiles the best kernel for the current shape
 
 Mnemonic: use FP4/FP8 only when the model is confident or memory is tight, fall back to BF16/FP16 when uncertainty rises, and smooth the switch with hysteresis so precision adapts without flapping.
+
+Kernel autotuning for attention and MLP paths
+
+Why autotuning matters
+
+- Two big compute paths dominate transformers:
+	- self-attention
+	- feed-forward MLP
+- Best kernel depends on runtime shape:
+	- sequence length
+	- batch size
+	- tile size
+	- shared-memory pressure
+	- occupancy
+- One fixed kernel leaves performance on the table
+
+Attention autotuning
+
+- Short sequences:
+	- simpler attention kernel can win
+	- avoids FlashAttention setup overhead
+- Long sequences:
+	- tiled / FlashAttention-style kernels win
+	- shared-memory reuse avoids repeated HBM fetches
+
+Practical rule of thumb
+
+- if seq_len < ~128-256 → standard kernel may be faster
+- else → tiled / FlashAttention kernel usually wins
+- Exact breakeven depends on hardware, so benchmark it
+
+Visual
+
+	short L   → simple kernel
+	long  L   → tiled / FlashAttention kernel
+
+Tile-size tradeoff example
+
+	┌───────────┬──────────────────┬───────────────┬──────────────────┐
+	│ Tile      │ Shared mem       │ Occupancy     │ Throughput       │
+	├───────────┼──────────────────┼───────────────┼──────────────────┤
+	│ 64×64     │ 48 KB            │ 85%           │ 8.2 GOPS         │
+	│ 128×64    │ 64 KB            │ 78%           │ 10.5 GOPS        │
+	│ 128×128   │ 96 KB            │ 72%           │ 9.8 GOPS         │
+	│ 256×128   │ 128 KB           │ 60%           │ 11.3 GOPS        │
+	└───────────┴──────────────────┴───────────────┴──────────────────┘
+
+What this shows
+
+- Larger tiles:
+	- more data reuse
+	- fewer global-memory loads
+	- higher sustained throughput on long sequences
+- But also:
+	- more registers / shared memory
+	- fewer blocks resident per SM
+	- lower occupancy
+- So best tile is a shape-dependent tradeoff, not "largest wins"
+
+MLP autotuning
+
+- MLP = big GEMMs with nonlinearity in between
+- cuBLAS / cuBLASLt / CUTLASS often have multiple algorithms per shape
+- Best algorithm can differ for:
+	- batch=1
+	- batch=16
+	- same hidden dim, different shape aspect ratio
+- Engines can:
+	- benchmark candidate GEMM kernels on first encounter
+	- cache the winner for that shape
+	- reuse it on subsequent calls
+
+Runtime strategy
+
+- New shape appears:
+	1. benchmark a few candidate kernels
+	2. pick fastest algorithm
+	3. cache by shape
+	4. reuse until workload changes
+
+Triton / CUTLASS style tuning
+
+- Triton can JIT multiple variants with different tile shapes
+- CUTLASS / cuBLASLt can search algorithm space too
+- Runtime measures actual performance on the target GPU
+- Empirical tuning beats theoretical guesses under real cache/bank-conflict behavior
+
+Profiling guidance
+
+- Nsight Systems:
+	- CUDA timelines
+	- memcpy / NVLink activity
+	- kernel overlap
+- Nsight Compute:
+	- memory workload analysis
+	- L2 misses
+	- cache / bank conflict clues
+- Use both when comparing tile variants side by side
+
+Occupancy-based launch tuning
+
+- Larger tile may lower occupancy by consuming too much shared memory
+- Smaller tile may improve latency on short sequences by letting more blocks run concurrently
+- Some systems query CUDA Occupancy API at runtime to choose:
+	- thread block size
+	- shared-memory usage
+	- launch parameters
+
+Occupancy intuition
+
+	long sequences:
+		bigger tiles → better reuse → fewer HBM loads → faster
+
+	short sequences:
+		smaller tiles → more resident blocks / SM → lower latency
+
+Autotuner's real job
+
+- Balance:
+	- throughput
+	- occupancy
+	- shared-memory footprint
+	- launch overhead
+	- actual observed latency
+- Inference frameworks usually automate this internally
+
+Mnemonic: short sequences want small simple kernels, long sequences want large tiled kernels, and the autotuner's job is to trade shared-memory reuse against occupancy until it finds the fastest shape-specific path.

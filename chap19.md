@@ -685,3 +685,122 @@ Trade-off
 - So validate access patterns and storage tiers before using it
 
 Mnemonic: speculative KV prefetching means guessing the next KV pages the decoder will need, pulling them in early while other work is happening, and hoping the guess is right so decode doesn't stop to wait on memory.
+
+KV offload and one-layer-ahead prefetching
+
+Why this exists
+
+- Modern KV caches are enormous:
+	- many layers
+	- huge context windows
+	- long reasoning traces
+- So systems often tier KV across:
+	- GPU HBM
+	- CPU memory
+	- SSD / NVMe
+
+Naive way (bad for TTFT)
+
+- Need next token
+- Synchronously fetch missing KV from CPU / SSD
+- Then run decode
+- Result: first token and next-step latency stall on data movement
+
+Better way: prefetch KV early
+
+- Start moving needed KV pages toward GPU as soon as possible
+- Overlap data movement with prefill / current-layer compute
+- By the time decode reaches that layer, KV is already local or in flight
+
+Regular KV prefetching
+
+- Keeps only current layer's KV on GPU
+- Offloads other layers' KV to CPU
+- During layer i compute:
+	- prefetch layer i+1 KV into GPU
+	- write layer i-1 KV back to CPU
+- Net effect: one-layer-ahead pipeline
+
+Visual
+
+	layer 1 compute      | prefetch layer 2 KV | evict layer 0 KV
+	layer 2 compute      | prefetch layer 3 KV | evict layer 1 KV
+	layer 3 compute      | prefetch layer 4 KV | evict layer 2 KV
+
+	→ compute, prefetch, and eviction overlap continuously
+
+Why it helps
+
+- GPU rarely waits for KV to arrive
+- CPU-resident KV becomes much less painful
+- Throughput penalty still exists, but often only ~5-10%
+- Remaining cost comes from CPU DRAM bandwidth + PCIe overhead
+
+Hugging Face example
+
+- `generate(cache_implementation="offloaded")`
+	- dynamic / variable-length serving
+- `generate(cache_implementation="offloaded_static")`
+	- static shapes + `torch.compile` + CUDA Graphs
+	- highest throughput when shapes are fixed
+
+What OffloadedCache is doing underneath
+
+- Move layer 1 KV to GPU
+- While layer 1 computes, async DMA layer 2 KV to GPU
+- Before layer 2 starts, its KV is already local
+- Repeat for each layer
+- This is classic prefetching, not speculative branching yet
+
+TTFT angle
+
+- By end of prefill, ideally the decode-critical caches are:
+	- already in GPU memory, or
+	- already queued for transfer
+- That shrinks the stall between prefill finishing and first token generation starting
+- Use NVTX markers to measure first-token decode idle time and catch missed prefetches
+
+How to implement overlap yourself
+
+- Use a dedicated nonblocking prefetch stream
+- Use main compute stream for forward/decode
+- Launch async copy on prefetch stream
+- Record an event when KV copy is ready
+- Make compute stream wait ONLY right before the KV is consumed
+
+Visual: streams
+
+	compute_stream : [forward current token] ----wait kv_ready---- [consume KV]
+	prefetch_stream:        [cudaMemcpyAsync next KV chunk] --record event--
+
+	→ sync happens just-in-time, not upfront
+
+Important implementation details
+
+- Host buffers must be pinned (`cudaMallocHost` / page-locked)
+	- otherwise `cudaMemcpyAsync` may serialize
+- If source is another GPU:
+	- use `cudaMemcpyPeerAsync`
+	- enable peer access
+- If using Unified Memory:
+	- `cudaMemPrefetchAsync` can stage pages ahead of time
+- If pattern repeats:
+	- capture the sequence in CUDA Graphs to cut launch overhead
+
+Pipeline mindset
+
+- Treat data movement as part of inference, not as a separate afterthought
+- Always try to have the NEXT needed KV / weights in flight while CURRENT compute runs
+- Same idea as compute pipelining, but for memory transfers
+
+Where this sits relative to speculative prefetching
+
+- Regular KV prefetching:
+	- one-layer-ahead, deterministic
+	- "I know layer i+1 will be needed next"
+- Speculative KV prefetching:
+	- predict which future path/pages will likely be needed
+	- useful when branch/path is uncertain or multi-path
+
+Mnemonic: ordinary KV prefetching is a conveyor belt, not a guess — while layer i computes, layer i+1's KV is already moving in and layer i-1's KV is moving out, so decode almost never stops to wait on memory.
+

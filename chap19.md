@@ -543,3 +543,145 @@ Why this matters
 - Dynamic shared-memory allocation lets one kernel binary serve both efficiently
 
 Mnemonic: autotuning is a measure-pick-cache loop, and occupancy-aware shared memory means choosing the biggest tile that improves reuse without starving the SM of active blocks.
+
+Register pressure, carveout tuning, and speculative KV prefetching
+
+Register pressure matters too
+
+- More registers per thread can speed one thread up
+- But SMs have a fixed register file
+- If each thread uses too many registers:
+	- fewer warps fit on the SM
+	- occupancy drops
+- Runtime can switch to a lower-register kernel variant
+	- more instructions
+	- but higher occupancy
+
+How adaptive systems detect the problem
+
+- Nsight Systems / Nsight Compute:
+	- achieved occupancy
+	- execution efficiency
+	- memory stalls
+- CUDA Occupancy API:
+	- how many blocks/warps fit per SM
+- DCGM:
+	- real-time SM / GPU utilization at system level
+
+What the controller looks for
+
+- idle warps / low active warps (< 50%)
+- memory stall cycles (> 70%)
+- example: seq_len 2048 attention only reaches 30% occupancy
+
+Possible fix
+
+- reduce per-block shared memory
+- split attention work into more passes
+- use fewer registers or smaller blocks
+- may raise occupancy enough to improve throughput
+- but if kernel is memory-bound, MORE shared memory can still win by reducing stalls
+
+Bottom line
+
+- occupancy is not always "higher is better"
+- best point is where reuse, occupancy, and stalls are balanced
+
+Runtime launch table idea
+
+- Keep a small mapping from problem size → launch config
+- Example:
+	- seq_len 512  → 128 threads/block, 16 KB smem
+	- seq_len 4096 → 256 threads/block, 64 KB smem
+- Store in JSON / config for easy updates across new models and GPUs
+
+L1 vs shared-memory carveout
+
+- Modern NVIDIA GPUs share one on-chip pool between:
+	- L1 cache
+	- shared memory
+- Runtime can bias the split per kernel using `cudaFuncSetAttribute`
+- Example:
+	- default maybe 50/50
+	- large-tile attention may prefer 75% shared / 25% L1
+- Important: carveout is a HINT, not a guarantee
+- Must verify effect with profiling
+
+Why this section matters
+
+- Dynamic shared memory + occupancy-aware selection keep SMs busy for each layer shape
+- Especially important when some layers or batch sizes would otherwise underutilize the GPU
+
+Speculative KV prefetching for faster TTFT
+
+What problem it solves
+
+- TTFT suffers when decode must wait for the needed KV state to be ready
+- If some KV lives in compressed / off-GPU tiers, loading it can delay the first token
+- Idea: fetch likely-needed KV BEFORE the decode step asks for it
+
+Core intuition
+
+- "Speculative" here means:
+	- predict which KV blocks / token path will be needed next
+	- prefetch them early
+- If prediction is right, decode finds the KV already warm / loaded
+- If prediction is wrong, you wasted some bandwidth, but maybe still improved latency overall
+
+SpeCache-style flow
+
+- KV is compressed and partly off-GPU
+- After the first output token is generated:
+	- system also computes a speculative next token/path
+	- while decode continues, it prefetches reduced-precision KV for that speculative path
+- On later steps:
+	- actual path + speculative path are advanced in parallel
+	- top-k likely KV chunks for the speculative branch are prefetched ahead of time
+
+Visual
+
+	Without prefetch:
+		need token t1
+			↓
+		fetch KV from slower tier
+			↓
+		decode t1
+		→ TTFT / next-step latency includes fetch wait
+
+	With speculative prefetch:
+		predict likely next path
+			↓
+		fetch likely KV EARLY while other compute is happening
+			↓
+		when decode needs it, KV is already there
+		→ wait largely hidden
+
+Simple mental model
+
+	normal:
+		ask for book → librarian walks to shelf → returns → you read
+
+	speculative prefetch:
+		librarian guesses which book you'll ask for next and puts it on the desk early
+		if correct, you read immediately
+
+What is being prefetched exactly
+
+- Not "all possible future KV"
+- Usually a reduced-precision subset of the most likely KV chunks / pages
+- Often top-k most relevant items for the speculative branch
+- This keeps bandwidth under control
+
+Why this can help TTFT
+
+- First-token latency is sensitive to setup delays
+- If KV movement/prep overlaps with earlier compute, the critical path shrinks
+- Especially useful when KV is tiered across GPU / CPU / storage
+
+Trade-off
+
+- Correct speculation → lower latency
+- Wrong speculation → wasted transfer / prefetch work
+- So validate access patterns and storage tiers before using it
+
+Mnemonic: speculative KV prefetching means guessing the next KV pages the decoder will need, pulling them in early while other work is happening, and hoping the guess is right so decode doesn't stop to wait on memory.

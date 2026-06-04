@@ -426,3 +426,120 @@ Autotuner's real job
 - Inference frameworks usually automate this internally
 
 Mnemonic: short sequences want small simple kernels, long sequences want large tiled kernels, and the autotuner's job is to trade shared-memory reuse against occupancy until it finds the fastest shape-specific path.
+
+6/4/26:
+
+Autotuning workflow and occupancy-aware shared memory
+
+Six-step autotuning loop
+
+	1. measure workload
+		 - inspect batch size, sequence length, and shape
+	2. select candidates
+		 - attention kernel choices, GEMM variants, launch configs
+	3. estimate / benchmark
+		 - quick trial runs on sample inputs
+	4. choose best
+		 - lowest latency or enough throughput
+	5. cache result
+		 - store by shape / workload signature
+	6. execute
+		 - run the layer with the chosen kernel
+
+- This is like a database query optimizer picking a query plan
+- Over time the engine builds a library of "best kernels for this shape"
+
+How to keep autotuning overhead low
+
+- Tune asynchronously in a separate stream while a default kernel runs
+- Or tune during low-traffic periods
+- Add warm-up on model load:
+	- max sequence length
+	- max batch size
+	- common production shapes
+- Keep monitoring per-layer latency at runtime
+- If a layer becomes a bottleneck, revisit kernel selection
+- Advanced systems may use multiarmed bandits to keep exploring alternatives
+
+Bottom line
+
+- Static kernels become adaptive kernels
+- Engine keeps retuning itself as traffic patterns change
+
+Dynamic shared-memory allocation + occupancy-aware selection
+
+Core idea
+
+- Shared memory per SM is limited
+- Registers per SM are limited
+- Occupancy = how many blocks/warps can stay active on an SM
+- Better performance comes from balancing:
+	- data reuse in shared memory
+	- occupancy / latency hiding
+
+Tile size tradeoff
+
+- Let T = attention tile width in tokens
+- Each block stores Q, K, V tiles in shared memory
+- Shared memory per block grows like O(T^2)
+
+Large tile (e.g. T=256)
+
+- Pros:
+	- reuse K/V more
+	- fewer DRAM loads
+	- better for long sequences
+- Cons:
+	- huge shared-memory footprint
+	- fewer blocks fit per SM
+	- occupancy can drop hard
+	- example: 1 block/SM, ~30% occupancy
+
+Small tile (e.g. T=64)
+
+- Pros:
+	- much lower shared-memory use
+	- more blocks fit per SM
+	- better latency hiding and utilization
+- Cons:
+	- reload K/V more often
+	- more DRAM traffic
+
+Visual
+
+	big T  → more reuse, less DRAM, lower occupancy
+	small T → less reuse, more DRAM, higher occupancy
+
+What determines optimal T
+
+- sequence length L
+- GPU shared memory per block
+- number of SMs
+- register pressure / threads per block
+- actual DRAM thrash vs occupancy in practice
+
+Runtime selection pattern
+
+- choose T from candidate set like 64 / 128 / 256
+- compute `shared_mem_bytes = 3 * T * T * sizeof(float)` for Q/K/V tiles
+- launch same kernel binary with different dynamic shared-memory size
+- use `extern __shared__` buffer inside the kernel
+- same kernel, different launch-time tile configuration
+
+Occupancy feedback loop
+
+- Query CUDA Occupancy API after picking T
+- If only 1 block fits per SM and occupancy is poor:
+	- reduce T
+- If DRAM is thrashing and occupancy is already healthy:
+	- increase T
+- Can use CUDA Occupancy API or DCGM to drive the loop
+- Result: each layer adapts tile size to current L and hardware limits
+
+Why this matters
+
+- Long-sequence attention wants more reuse
+- Short-sequence attention wants more active blocks
+- Dynamic shared-memory allocation lets one kernel binary serve both efficiently
+
+Mnemonic: autotuning is a measure-pick-cache loop, and occupancy-aware shared memory means choosing the biggest tile that improves reuse without starving the SM of active blocks.

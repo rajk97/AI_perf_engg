@@ -1074,3 +1074,132 @@ Practical recommendation
 
 Mnemonic: switch cache bit-width only between chunks, log and cool down policy flips, use eviction when compression is not enough, and think of RL as the meta-scheduler that learns how to tune all those knobs together.
 
+RL policy optimization, guardrails, and observability
+
+Why RL can beat fixed rules
+
+- Some good configurations are nonintuitive
+- Example pattern the agent might discover:
+	- long prompts → PP + FP4 compression
+	- short prompts → TP-only + FP8
+- Hard-coded rules often miss these interactions across knobs
+
+How the RL loop works
+
+- Observe state
+	- GPU util
+	- memory util
+	- latency
+	- queue depth
+- Pick action
+	- e.g. change precision, batching, PP/TP mode
+- Apply policy
+- Observe new state
+- Compute reward
+- Update agent
+
+Visual
+
+	state → action → apply config → observe result → reward → policy update
+
+Training approaches
+
+- Offline:
+	- log production traces
+	- train in simulator / replay environment
+	- libraries like TRL can help for RL workflows
+- Online shadow mode:
+	- live system explores cautiously
+	- decisions do not fully control production at first
+- Explore/exploit loop:
+	- mostly use current best policy
+	- occasionally try alternatives to gather new data
+
+Why PPO is mentioned
+
+- Proximal Policy Optimization (PPO)
+- Good for gradual policy updates
+- Less likely to thrash between extreme decisions
+- Fits continuous / changing runtime environments well
+
+How to reduce oscillation
+
+- Damping:
+	- keep an action active for a minimum time / request count
+- Hysteresis-like behavior for policy changes
+- Override only for critical SLO violations
+
+Guardrails are mandatory
+
+- RL can make unsafe decisions while learning
+- So constrain the action space:
+	- only reasonable precision modes
+	- bounded batch sizes
+	- safe parallelism choices
+- Start from a solid heuristic default policy
+- Let RL tune around that baseline, not from scratch
+
+Reward shaping
+
+- Give strong negative reward for unsafe events:
+	- latency hard-limit violation
+	- OOM
+	- catastrophic throughput collapse
+- Can also hard-code forbidden actions regardless of reward
+- This gives RL + rule-based safety together
+
+Reward design patterns
+
+- Hard penalty:
+	- `reward = tokens_per_second - 1000 * (1 if latency > SLA else 0)`
+	- simple, harsh, binary
+- Soft penalty:
+	- `reward = tokens_per_second - λ * max(0, latency - SLA)`
+	- smoother tradeoff, often more stable
+
+Hard vs soft penalty intuition
+
+- Binary penalty:
+	- easy to reason about
+	- can create abrupt policy jumps
+- Continuous penalty:
+	- smoother gradients
+	- gentler tradeoff decisions
+	- often better training stability
+
+Multi-objective view
+
+- This is really throughput vs latency vs sometimes quality
+- Weighted sum is simplest
+- More advanced framing:
+	- partially observable decision process
+	- Pareto-front style tradeoffs
+- Useful when one scalar reward is too crude
+
+Observability requirements
+
+- Log every:
+	- state
+	- action
+	- reward
+	- resulting latency / throughput outcome
+- Use structured logging, counters, dashboards
+- Needed to debug weird behavior fast
+
+Escape hatch / kill switch
+
+- Always provide fallback to safe static policy
+- Example:
+	- if p95 latency jumps >50% after enabling RL
+	- auto-disable agent actions
+	- alert on-call
+- This keeps experimentation reversible
+
+Big picture
+
+- RL tuning is not yet mainstream, but it is emerging
+- As inference systems gain more runtime knobs, self-tuning becomes more attractive
+- Direction of travel: inference servers that learn expert-level tuning from telemetry
+
+Mnemonic: RL is the meta-controller above all the other knobs — let it learn the weird interactions, but cage it with safe actions, shaped rewards, damping, logs, and a kill switch.
+

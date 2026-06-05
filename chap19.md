@@ -804,3 +804,137 @@ Where this sits relative to speculative prefetching
 
 Mnemonic: ordinary KV prefetching is a conveyor belt, not a guess — while layer i computes, layer i+1's KV is already moving in and layer i-1's KV is moving out, so decode almost never stops to wait on memory.
 
+Real-time KV cache compression and policy switching
+
+Why compress KV at all
+
+- KV grows linearly with generated/context tokens
+- For long chats, documents, and reasoning traces, KV often becomes the biggest memory consumer
+- Compression reduces:
+	- GPU memory pressure
+	- network/offload bandwidth
+	- OOM risk
+
+Simplest and most practical method: quantization
+
+- Baseline KV is often FP16 / BF16
+- Many systems can compress KV to INT8 or INT4 with little quality loss
+- Hugging Face supports this via `cache_implementation="quantized"`
+- Cost: a bit of quantize/dequantize compute
+- Benefit: large memory savings, usually small quality impact
+
+If quantization and CPU offload are combined
+
+- Host buffers should be pinned (page-locked)
+- Otherwise copies may serialize and copy bandwidth drops
+
+Policy switching = change compression strategy as conditions change
+
+Example policy ideas
+
+- Keep the newest 128 tokens in full precision
+- Compress older tokens to 4-bit
+- Rationale:
+	- recent context usually matters most
+	- older context can often tolerate more compression due to recency bias
+
+Adaptive policy triggers
+
+- Prompt length gets very large
+	- widen or shrink the full-precision window
+- GPU memory usage crosses threshold
+	- e.g. >80% → compress all KV to 8-bit
+	- severe pressure → switch to 4-bit
+- Value distribution / variance suggests aggressive quantization is safe
+
+Multi-tier compression policy
+
+	mild pressure    → INT8 KV
+	high pressure    → INT4 KV
+	hottest recent   → FP16/BF16 residual window
+
+Why dynamic switching is tricky
+
+- During generation, the engine may need to change policy mid-session
+- That means the compressed representation must be ready before it is needed
+- Practical tools:
+	- double buffering
+	- background compression threads
+	- safe-point switching (end of iteration, not mid-matmul)
+
+One practical design
+
+- Keep FP16 active initially
+- Build INT8 copy in background
+- If memory threshold is crossed:
+	- switch reads to INT8 version
+	- free FP16 memory
+- Future attention reads dequantize from INT8
+
+Important implementation note
+
+- Switch policies only at safe boundaries, like the end of a decode iteration
+- Hide requantization latency on a background stream
+- Avoid mid-calculation format swaps
+
+What not to over-focus on
+
+- Lossless methods (entropy coding, ZFP, clustering) exist
+- But production KV paths rarely use them because throughput is worse
+- In practice, quantization wins on the speed / memory / simplicity tradeoff
+
+Production guidance
+
+- Quantization is the default practical answer
+- Expect roughly 2-4× memory reduction depending on bit-width
+- Lossless compression remains mostly research/offline today
+
+How good quantization is done
+
+- Better than one global scale:
+	- per-head
+	- group-wise / per-channel scaling
+	- residual window for recent tokens
+- Hugging Face QuantizedCache uses per-channel group-wise quantization
+- Range is calibrated per attention head
+- This is basically magnitude / min-max style quantization
+
+HQQ backend
+
+- Half-Quadratic Quantization (HQQ)
+- Calibration-free, on-the-fly quantizer
+- Supports 2/3/4/8-bit
+- Handles outliers / heavy-tailed error well
+- Integrated with Transformers KV cache path
+- Has both PyTorch and CUDA implementations
+
+Dynamic bit-width switching in practice
+
+- Transformers does NOT let you mutate an already-created cache object's bit-width in place
+- Practical workaround:
+	- generate in chunks
+	- when memory pressure rises, start next chunk with a new cache config
+	- similar to falling back to offloaded cache on OOM
+
+Visual
+
+	start of session:
+		recent KV  → FP16/BF16
+		old KV     → FP16/BF16
+
+	memory pressure rises:
+		recent KV  → FP16/BF16 residual window
+		older KV   → INT8
+
+	severe pressure:
+		recent KV  → FP16/BF16 residual window
+		older KV   → INT4
+
+Why this works
+
+- Most useful context is often recent
+- Older tokens can often be stored more cheaply
+- Compression policy becomes another runtime control knob, like precision or parallelism
+
+Mnemonic: KV compression is the memory-pressure relief valve — keep the freshest tokens high precision, squeeze the cold history to INT8 or INT4, and switch policies only at safe iteration boundaries.
+

@@ -938,3 +938,139 @@ Why this works
 
 Mnemonic: KV compression is the memory-pressure relief valve — keep the freshest tokens high precision, squeeze the cold history to INT8 or INT4, and switch policies only at safe iteration boundaries.
 
+Chunked cache switching, eviction policies, and RL tuning
+
+Dynamic quantized cache in practice
+
+- Start with modest compression, e.g. INT8 HQQ
+- Watch true device memory with `torch.cuda.mem_get_info()`
+- If used ratio crosses threshold (example: 90%)
+	- switch NEXT chunk to a lower-bit cache, e.g. INT4
+- Generate in small chunks so policy can change safely between chunks
+- Do not mutate an already-live cache object in place
+
+Why chunking matters
+
+- Transformers' quantized cache API configures the cache at creation time
+- So safe policy switching means:
+	- finish current chunk
+	- create next chunk with new cache config
+	- continue generation
+- This avoids private/internal cache hacks
+
+Recommended operational safeguards
+
+- Log every policy switch or increment a counter
+- Correlate switches with:
+	- output anomalies
+	- quality regressions
+	- latency spikes
+- Add hysteresis / cooldown so bit-width does not flap up and down
+
+Policy can also depend on request class
+
+- Premium user → lighter compression / better quality
+- Free tier → heavier compression / max throughput
+- Request metadata becomes another control signal
+
+Eviction and context management
+
+- Compression is not the only tool
+- Another runtime policy is eviction / dropping old context
+- Example options:
+	- LRU-style discard of very old tokens
+	- sliding-window attention
+	- compress old context into a summary
+- Useful when model has recency bias or explicit sliding-window attention
+
+Visual
+
+	recent tokens     → keep in window / high precision
+	old tokens        → quantize more aggressively
+	very old tokens   → evict or summarize
+
+Production rule of thumb
+
+- A high-watermark memory trigger (around 80%) is often enough to avoid OOMs
+- But always validate 4-bit vs 8-bit on your domain-specific outputs
+
+Reinforcement learning agents for runtime tuning
+
+Why RL enters the picture
+
+- The system now has many runtime knobs:
+	- parallelism mode
+	- precision mode
+	- batch size / wait time
+	- cache compression on/off
+	- speculative decoding on/off
+	- draft-model choice
+	- speculative KV prefetch on/off
+- Hand-written heuristics can become messy
+- RL offers one unified controller for trading off throughput vs latency vs quality
+
+How to frame it
+
+- Environment = live inference system + metrics
+- State = current observations
+	- GPU utilization
+	- memory utilization
+	- average latency
+	- queue length
+	- etc.
+- Actions = control knobs the agent can change
+- Reward = business objective
+
+Example RL action space
+
+	1. choose parallelism mode (single / TP / PP / hybrid)
+	2. choose precision mode (FP8 vs FP8+FP4)
+	3. adjust batch size or wait time
+	4. enable/disable cache compression
+	5. enable/disable speculative decoding
+	6. choose smaller draft model
+	7. choose larger draft model
+	8. enable/disable speculative KV prefetching
+
+Example reward
+
+- `reward = throughput - λ * max(0, latency - SLA)`
+- Meaning:
+	- maximize throughput
+	- punish latency only when it exceeds SLA
+- λ controls how painful SLA violations are
+
+How to think about λ
+
+- Bigger λ:
+	- safer latency
+	- less aggressive throughput chasing
+- Smaller λ:
+	- more throughput-seeking
+	- tolerates some latency overshoot
+- Practical calibration:
+	- choose λ so a typical latency overshoot costs about as much as the throughput gain you would trade for it
+
+Important training guidance
+
+- Normalize state features
+- Example:
+	- queue length / max_queue
+	- utilization as 0..1
+- Helps convergence because agent doesn't need to learn feature scale separately
+
+What the agent can learn over time
+
+- when cache compression is worth it
+- when PP beats TP for the current load
+- when speculative decode helps enough to justify cost
+- when to accept slight latency risk for throughput gain
+
+Practical recommendation
+
+- Start with heuristics as the baseline
+- Only layer RL on top after the simple rules are stable and measurable
+- RL is an incremental optimizer, not the first thing to build
+
+Mnemonic: switch cache bit-width only between chunks, log and cool down policy flips, use eviction when compression is not enough, and think of RL as the meta-scheduler that learns how to tune all those knobs together.
+

@@ -1321,3 +1321,159 @@ Practical mental model
 
 Mnemonic: allocator switching is usually a process-level failover, not a live in-process toggle — detect fragmentation from reserved-vs-allocated gaps, and if needed retry the request in a fresh worker started with `cudaMallocAsync`.
 
+Slab allocators, hot-swappable kernels, and CUDA graph prewarming
+
+Why slab allocators show up in inference engines
+
+- Some allocations repeat at exactly the same size over and over
+- Example: per-token buffers / activation tensors of a fixed size like 64 KB
+- A slab allocator prepartitions memory into fixed-size blocks for that object size
+- Result:
+	- very fast reuse
+	- near-zero fragmentation for that size class
+
+Important nuance
+
+- Slab memory is usually not returned to the general pool until the whole slab is free
+- So slabs are great for stable repeated sizes, not for everything
+
+Good design pattern
+
+- Separate long-lived and short-lived allocations
+- Example:
+	- model weights → default caching allocator / large static pool
+	- ephemeral per-token buffers → slab/custom pool
+- This makes allocator choice much easier and cleaner
+
+Fallback after OOM
+
+- Production systems often do NOT fail immediately
+- They may retry with:
+	- GPU cache cleared
+	- more CPU offload
+	- more compression
+	- alternate allocator / worker setup
+- Goal: graceful degradation instead of request failure
+
+Runtime kernel improvements and hot-swappable implementations
+
+Core idea
+
+- Better kernels appear constantly:
+	- newer FlashAttention variants
+	- megakernels
+	- hardware-specific optimizations
+- Hot swapping means replacing a slower implementation with a faster one WITHOUT full model reload / service restart
+
+Simple Python-level approach
+
+- Monkey-patch `forward` to call a new library implementation
+- Or replace a method with a `torch.compile`'d version
+- Effectively swaps the function pointer / callable used by the model
+
+Examples
+
+- old SDPA attention → new FlashAttention-3 style kernel
+- raw `forward` → `torch.compile(..., backend="inductor")` compiled version
+
+Why this matters
+
+- 24/7 services can't restart every time a kernel improves
+- Zero-downtime upgrades are valuable when reloads would hurt latency or availability
+
+But there are strict conditions
+
+- New kernel must be drop-in compatible
+- Numerical output must match old kernel within tolerance
+- Thread safety matters:
+	- drain queue or use barrier
+	- do not patch while another thread is inside the function
+
+Operational rollout pattern
+
+- Canary / shadow test a small traffic slice first
+- Compare latency, throughput, and output drift
+- If healthy, ramp traffic up
+- If not, rollback using feature flag / impl registry
+
+Feature-flag style implementation
+
+- Maintain registry like:
+	- `attention_impl = "fast"`
+	- `attention_impl = "safe"`
+- Toggle implementation through config/flags
+- Lets you rollback quickly without code redeploy
+
+Connection to autotuning
+
+- Autotuner finds faster kernel variant for live workload
+- Runtime patching promotes that implementation to the default
+- This closes the loop:
+	- discover better kernel
+	- swap it in
+	- keep measuring
+
+Memory caution
+
+- Multiple kernel implementations loaded at once consume code + memory
+- Too many variants can hurt instruction cache and memory footprint
+
+Per-request kernel choice
+
+- Long sequences may use the fancy optimized kernel
+- Short sequences may use the simpler one
+- Runtime can choose implementation per request / per shape
+
+Continuous prewarming of CUDA Graphs and caches
+
+Why prewarm
+
+- Cold starts cost latency:
+	- JIT compilation
+	- cache coldness
+	- CUDA Graph capture/setup
+- If you can predict demand, you can prepare before traffic arrives
+
+What gets prewarmed
+
+- model weights into caches
+- JIT-compiled kernels
+- CUDA Graphs for common batch sizes / shapes
+
+How prediction helps
+
+- Use time-series forecasting (ARIMA / Prophet / historical schedules)
+- Example:
+	- traffic spike every day at 9 a.m.
+	- run warm-up shortly before 9 a.m.
+	- capture graphs for batch sizes likely during the spike
+
+Why CUDA Graphs fit this well
+
+- They are static / shape-specific
+- Inference often uses a small set of common batch sizes: 1, 2, 4, 8, 16...
+- So you can maintain a pool of pre-captured graphs for common shapes
+
+Visual
+
+	before spike:
+		predict common batch sizes → capture graphs for 1/2/4/8/16
+		warm kernels + caches
+
+	during spike:
+		incoming batch=16 → reuse prewarmed graph
+		one graph launch instead of many individual kernel launches
+
+Benefits
+
+- Less Python→CUDA dispatch overhead
+- Faster first execution for common shapes
+- Better latency under predictable bursty traffic
+
+Trade-off
+
+- If prediction is wrong, you prewarm graphs that go unused
+- So monitor prediction hit rate to make sure prewarming is worth it
+
+Mnemonic: use slabs for repeated tiny buffers, hot-swap kernels behind clean module boundaries, and prewarm CUDA graphs for the shapes tomorrow's traffic is most likely to need.
+

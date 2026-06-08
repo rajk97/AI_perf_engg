@@ -1203,3 +1203,121 @@ Big picture
 
 Mnemonic: RL is the meta-controller above all the other knobs — let it learn the weird interactions, but cage it with safe actions, shaped rewards, damping, logs, and a kill switch.
 
+Dynamic memory-allocation switching
+
+Why allocators matter
+
+- Inference servers allocate/free thousands of tensors per second
+- Bad allocation strategy causes:
+	- fragmentation
+	- allocation latency
+	- false OOMs (memory exists, but not contiguously enough)
+
+Three allocator ideas in this section
+
+	┌──────────────────────┬──────────────────────────────────────────────┐
+	│ Allocator style      │ Main idea                                    │
+	├──────────────────────┼──────────────────────────────────────────────┤
+	│ BFC / caching        │ grab big chunks, subdivide, reuse, coalesce  │
+	│ (PyTorch default)    │ avoids frequent cudaMalloc/cudaFree          │
+	├──────────────────────┼──────────────────────────────────────────────┤
+	│ Buddy + slab         │ buddy handles big power-of-two pages, slab   │
+	│                      │ handles many small fixed-size objects fast   │
+	├──────────────────────┼──────────────────────────────────────────────┤
+	│ cudaMallocAsync      │ CUDA driver-managed stream-ordered memory    │
+	│                      │ pools with recycling/coalescing              │
+	└──────────────────────┴──────────────────────────────────────────────┘
+
+What fragmentation looks like
+
+- Reserved memory is high
+- Allocated memory is much lower
+- Yet large allocations fail
+- Meaning: memory is free, but split into unusable holes
+
+How to detect it
+
+- `torch.cuda.memory_reserved()`
+- `torch.cuda.memory_allocated()`
+- Large growing gap = fragmentation warning
+- Also use:
+	- `torch.cuda.memory_summary()`
+	- PyTorch profiler with memory profiling
+	- Nsight Systems memory events / UM faults
+	- Nsight Compute memory workload analysis
+
+What the book means by "dynamic switching"
+
+- It does NOT really mean flipping allocators inside one live Python process
+- That's the confusing part
+- In PyTorch, allocator backend is effectively fixed once:
+	- `torch` imports and/or
+	- first CUDA context is created
+- After that, changing `PYTORCH_ALLOC_CONF` inside the same process does NOT reconfigure the allocator
+
+So what is actually possible?
+
+- You can dynamically choose the allocator for the NEXT fresh process
+- Pattern:
+	1. current worker hits OOM / fragmentation issue
+	2. free what you can in parent
+	3. spawn a NEW subprocess with `PYTORCH_ALLOC_CONF=backend:cudaMallocAsync`
+	4. import torch there
+	5. rebuild model there
+	6. rerun the request
+- So the switching is dynamic at the service / worker-process level, not inside one running CUDA process
+
+This is why the example looks "hacky"
+
+- It catches OOM in parent
+- serializes request to disk
+- launches child with env var set BEFORE torch import
+- child imports torch, creates fresh allocator, rebuilds model, retries generation
+
+Visual
+
+	live worker (default allocator)
+				↓ OOM / fragmentation
+	free cache + GC in parent
+				↓
+	spawn fresh child with PYTORCH_ALLOC_CONF=cudaMallocAsync
+				↓
+	child imports torch fresh
+				↓
+	child builds model and retries request
+
+Why `cudaMallocAsync` helps
+
+- Stream-ordered pooling
+- Driver knows dependency order of frees
+- Can recycle/coalesce memory more intelligently
+- Often gives many benefits of custom allocator tuning with low manual effort
+
+`max_split_size_mb` tuning
+
+- PyTorch lets you tune splitting behavior via `PYTORCH_ALLOC_CONF=max_split_size_mb:<value>`
+- Bigger split size:
+	- fewer tiny blocks
+	- lower metadata overhead
+	- but can leave bigger unused holes
+- Smaller split size:
+	- more flexible reuse
+	- but may flood allocator with tiny fragments
+
+Operational policies
+
+- If fragmentation grows over time:
+	- purge unused cache occasionally
+	- rolling-restart workers across fleet
+- These are intrusive and should be used carefully
+- If you need them often, root-cause allocator behavior instead of relying on resets forever
+
+Practical mental model
+
+- Default allocator is good for most workloads
+- `cudaMallocAsync` is often a strong default if you want stream-ordered pooling
+- "Dynamic switching" in practice means routing / retrying a request in a fresh worker configured differently
+- Not hot-swapping allocator internals inside a live Python process
+
+Mnemonic: allocator switching is usually a process-level failover, not a live in-process toggle — detect fragmentation from reserved-vs-allocated gaps, and if needed retry the request in a fresh worker started with `cudaMallocAsync`.
+

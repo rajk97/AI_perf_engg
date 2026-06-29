@@ -1477,3 +1477,157 @@ Trade-off
 
 Mnemonic: use slabs for repeated tiny buffers, hot-swap kernels behind clean module boundaries, and prewarm CUDA graphs for the shapes tomorrow's traffic is most likely to need.
 
+Graph-pool management, predictive warm-up, and adaptive batching
+
+CUDA Graph pool caveat
+
+- Each captured graph consumes GPU memory for workspace/state
+- Too many graphs → memory pressure
+- If memory gets tight:
+	- evict rarely used graphs
+	- keep only common batch/sequence shapes
+- Graph patching can adjust small shape differences
+- But graph pools are usually faster and simpler in practice
+
+Why graphs reduce CPU overhead
+
+- Without graph:
+	- CPU launches many individual kernels
+- With graph:
+	- CPU launches one `cudaGraphLaunch`
+- CPU is freed for preprocessing / routing / other real work
+
+Time-series driven prewarming
+
+- Forecast:
+	- RPS
+	- average prompt length
+	- expected batch sizes
+	- long-sequence spikes
+- Tools: ARIMA, Prophet, historical schedules
+- If forecast says traffic spike is coming:
+	- prewarm CUDA Graphs
+	- prefetch weights
+	- prepare memory pools
+	- scale prefill/decode workers
+	- raise continuous-batching target size
+
+Important: forecasts drift
+
+- Retrain/update predictors with recent traffic
+- Weird calendar effects can break old patterns
+- Monitor prediction hit rate and warm-up usefulness
+
+Scale-out warm-up
+
+- When autoscaler starts new GPU workers:
+	- run warm-up API calls before live traffic
+	- validate engine health
+	- trigger JIT compilation
+	- allocate memory pools
+	- capture CUDA Graph variants
+	- warm KV/model caches
+- Only add worker to live pool after warm-up completes
+
+Warm both sides of PD
+
+- Prefill workers:
+	- representative long prompts
+	- graph capture for expected prefill shapes
+	- KV cache prep
+- Decode workers:
+	- graph capture for token-step shapes
+	- speculative draft model loaded
+	- draft KV cache warmed
+	- loop-unrolled decode paths for fixed token counts
+
+Low-priority prewarming
+
+- Prewarm only when GPUs are underutilized when possible
+- Use lower-priority CUDA streams
+- Live inference streams should preempt warm-up work
+- Idle GPU time is free only if warm-up does not collide with real traffic
+
+Grace Blackwell note
+
+- Unified/coherent CPU-GPU memory enables extra tricks
+- CPU can stage data into unified memory before GPU needs it
+- Can reduce explicit copy calls later
+
+Why this matters
+
+- Moves one-time costs out of the critical path:
+	- JIT compile
+	- graph capture
+	- memory pool setup
+	- cache cold misses
+- Result: less jitter, fewer latency spikes, more predictable p99
+
+Adaptive batching
+
+Core idea
+
+- Batching increases throughput but can hurt individual latency
+- Adaptive batching changes batch size / wait thresholds as load changes
+
+Simple heuristic
+
+	┌────────────────────┬──────────────────────────────┐
+	│ Condition          │ Batch behavior               │
+	├────────────────────┼──────────────────────────────┤
+	│ GPU util > 80%     │ allow larger batches (8/16)  │
+	│ GPU util < 20%     │ use batch size 1             │
+	└────────────────────┴──────────────────────────────┘
+
+- High load → throughput matters
+- Low load → latency matters
+- More advanced systems use RL / prediction instead of fixed thresholds
+
+Prefill and decode need separate batching
+
+- Prefill:
+	- compute-heavy
+	- large prompt matmuls
+- Decode:
+	- memory-bandwidth-heavy
+	- one/few tokens per step
+- Modern engines batch them separately
+- A prefill batch and decode batch can run independently
+
+Chunked prefill
+
+- Problem:
+	- one huge prefill can block decode tasks
+	- pipeline bubbles appear because prefill and decode have mismatched durations
+- Fix:
+	- slice big prefill into smaller chunks
+	- interleave decode work between chunks
+- Effect:
+	- decode stays responsive
+	- prefill still progresses
+	- pipeline stages stay busier
+
+Visual
+
+	Naive:
+		[ huge 10k-token prefill -------------------- ] [decode][decode][decode]
+		decode waits behind the giant prefill
+
+	Chunked:
+		[prefill chunk][decode][prefill chunk][decode][prefill chunk][decode]
+		long prefill is time-sliced so decode can slip through
+
+Decode-maximal scheduling
+
+- vLLM-style scheduling can prioritize keeping decode moving
+- Chunked prefill creates gaps where decode batches can run
+- This reduces TPOT spikes while maintaining prefill throughput
+
+SARATHI result
+
+- Chunked prefill + piggybacked decode improves scheduling
+- Reported ~1.3-1.9× throughput over naive scheduling
+- Key idea: steer prefill and decode together instead of letting one block the other
+
+Mnemonic: prewarm the shapes before traffic arrives, batch bigger only when load demands it, and chunk giant prefills so decode can keep slipping through the schedule.
+

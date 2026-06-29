@@ -1631,3 +1631,114 @@ SARATHI result
 
 Mnemonic: prewarm the shapes before traffic arrives, batch bigger only when load demands it, and chunk giant prefills so decode can keep slipping through the schedule.
 
+Adaptive chunked prefill sizing
+
+Why chunk size matters
+
+- Huge prefill example: 10,000 tokens
+- Naive:
+	- one giant prefill monopolizes pipeline
+	- decode waits
+	- bubbles / latency spikes appear
+- Chunked:
+	- split into five 2,000-token chunks
+	- run decode batches between chunks
+	- smoother GPU utilization
+
+Rule of thumb
+
+- Pick chunk size so each prefill chunk takes ~50-100 ms
+- This gives frequent scheduling points for decode
+- Actual token count depends on:
+	- model size
+	- GPU hardware
+	- attention kernel
+	- current load
+
+vLLM-style adaptive scheduling
+
+- Scheduler continuously watches:
+	- token queues
+	- GPU utilization
+	- prefill backlog
+	- decode backlog
+- Then chooses:
+	- process another prefill chunk
+	- OR drain a decode batch
+- Goal: keep decode responsive while still progressing long prefills
+
+Occupancy-aware chunk sizing
+
+- Chunk size should respect GPU shared-memory and SM occupancy limits
+- Scheduler computes tile width `T`
+- Shared memory roughly:
+	- `shared_bytes = 3 * T * T * sizeof(float)`
+	- 3 = Q, K, V tiles
+- Then it asks: how many thread blocks can fit per SM with this `T`?
+
+Adaptive rule
+
+- If occupancy < 50%:
+	- shrink `T` (often halve it)
+	- frees shared memory
+	- more blocks can co-reside per SM
+- If DRAM traffic is too high and occupancy is healthy:
+	- grow `T`
+	- more KV reuse
+	- fewer global-memory loads
+
+Visual
+
+	T too large:
+		big reuse, but only 1 block/SM → low occupancy
+
+	T too small:
+		many blocks/SM, but reloads KV too often → DRAM pressure
+
+	good T:
+		enough reuse + enough active blocks
+
+Scheduler loop intuition
+
+	while work exists:
+		if GPU util < target and prefill pending:
+			choose largest prefill
+			choose T from occupancy table
+			launch one prefill chunk
+		elif decode pending:
+			form decode-maximal batch
+			launch decode batch
+		else:
+			poll event / wait for work
+
+Important thresholds in example
+
+- `TARGET_UTIL = 0.85`
+- `OCC_THRESHOLD = 0.5`
+- `BLOCK_THREADS = 256`
+- `SHMEM_LIMIT = 256 KB`
+
+Decode-maximal piggybacking
+
+- Between prefill chunks, scheduler forms one decode batch from ready requests
+- Short interactive decodes slip into gaps
+- Users with short prompts do not wait behind a giant long-prefill request
+
+What to log
+
+- chosen tile/chunk size `T`
+- occupancy
+- GPU utilization
+- prefill queue depth
+- decode queue depth
+- TPOT / TTFT impact
+- This verifies the scheduler is actually keeping utilization high
+
+Policy name
+
+- Utilization-maximization policy
+- Similar to OS scheduler trying to keep CPU busy
+- Here: keep SM slots filled and minimize dead GPU time
+
+Mnemonic: choose prefill chunks that create decode opportunities every ~50-100 ms, shrink T when occupancy is poor, grow T when DRAM is thrashing, and let decode batches piggyback through the gaps.
+

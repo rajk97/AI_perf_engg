@@ -1742,3 +1742,144 @@ Policy name
 
 Mnemonic: choose prefill chunks that create decode opportunities every ~50-100 ms, shrink T when occupancy is poor, grow T when DRAM is thrashing, and let decode batches piggyback through the gaps.
 
+Adaptive batching fairness and topology-aware scheduling
+
+Why chunked prefill helps user experience
+
+- Large-context prefills cannot monopolize the pipeline
+- Interactive decode steps get frequent chances to run
+- Small latency-critical requests are served quickly
+- GPU stays busy without making users wait behind giant context builds
+
+Scheduling rule of thumb
+
+- Treat prefill and decode as separate queues with separate SLAs
+- Decode is user-facing and latency-sensitive
+- Prefill is bulk context construction
+- So:
+	- run decode in dedicated time slices / streams first
+	- use leftover cycles for prefill chunks
+
+Example time budget
+
+- Reserve ~1-5 ms windows for ready decode work
+- Then schedule a prefill chunk if decode queue is drained or under control
+- This reduces perceived lag while still processing large prompts
+
+Producer-consumer execution model
+
+- Common engine pattern:
+	- one thread prepares decode inputs
+	- another thread prepares new prefills
+	- scheduler merges them into one optimized execution stream
+- Goal: overlap CPU prep, GPU scheduling, and actual GPU execution
+
+Multinode PD deployment
+
+- Prefill requests can go to prefill nodes
+- Decode requests can go to decode nodes
+- Each node pool can use phase-specific hardware
+
+Hardware specialization
+
+	┌──────────┬─────────────────────────────────────────────┐
+	│ Phase    │ Hardware preference                         │
+	├──────────┼─────────────────────────────────────────────┤
+	│ Prefill  │ high FLOPS / Tensor Cores, compute-heavy    │
+	│ Decode   │ high HBM capacity + bandwidth, memory-heavy │
+	└──────────┴─────────────────────────────────────────────┘
+
+Trade-off
+
+- Heterogeneous nodes can save cost
+- But they complicate dynamic load balancing
+- If traffic ratio shifts, decode-optimized GPUs may be bad at sudden prefill bursts
+- Homogeneous nodes simplify scheduling
+- Specialize hardware only when workload ratio is predictable enough
+
+Batching rules
+
+- Decode:
+	- batch ready decode calls whenever possible
+	- improves throughput and reduces launch overhead
+- Prefill:
+	- avoid mixing very short and very long prompts
+	- use length buckets, e.g. nearest 512-token bucket
+	- reduces padding waste
+
+Token-level scheduler
+
+- Forms decode batches at each generation step
+- Waits a few ms to gather ready tokens
+- Caps batch size by memory and occupancy limits
+- Uses fairness rules:
+	- round robin = everyone gets turns
+	- maximum delay = nobody waits beyond a deadline
+
+Net effect
+
+- Higher GPU utilization
+- Better aggregate latency
+- Fewer idle gaps
+- Less head-of-line blocking from huge prefills
+
+Congestion-aware and topology-aware scheduling
+
+Why topology matters
+
+- Modern racks like GB200 NVL72 / GB300 NVL72 connect 72 GPUs with NVLink/NVSwitch
+- Each GPU can reach peers through high-bandwidth fabric
+- But raw bandwidth alone is not enough
+- Bad traffic patterns can still oversubscribe links / switches
+
+NVL72 numbers to remember
+
+- 72 GPUs in one NVSwitch domain
+- B200: 180 GB HBM per GPU
+- B300: 288 GB HBM per GPU
+- Up to ~1.8 TB/s bidirectional NVLink per GPU
+- Over 130 TB/s aggregate cross-sectional bandwidth
+
+NVLink / NVSwitch mental model
+
+- NVLink = high-speed point-to-point GPU links
+- NVSwitch = rack-scale switch fabric connecting GPUs all-to-all
+- In NVL72:
+	- each GPU has many NVLink ports
+	- traffic goes through NVSwitch
+	- any GPU can reach any other GPU in roughly one fabric hop
+
+Visual
+
+	GPU0 ─┐
+	GPU1 ─┤
+	GPU2 ─┼── NVSwitch fabric ── GPU37
+	...  ─┤                    ── GPU71
+	GPU71─┘
+
+Important caveat
+
+- All-to-all topology does NOT mean infinite bandwidth
+- Per-port and per-switch limits still exist
+- Many-to-one traffic can oversubscribe ingress
+
+Example bottleneck
+
+	many GPUs sending KV to one decode GPU:
+
+	GPU1 ─┐
+	GPU2 ─┼──► GPU9
+	GPU3 ─┘
+
+	→ GPU9 ingress link / switch path becomes bottleneck
+
+What topology-aware scheduling tries to do
+
+- Use link-utilization telemetry
+- Avoid congested NVLink/NVSwitch paths
+- Route transfers to less-busy peers
+- Schedule collective operations in waves instead of all at once
+- Keep latency low while preserving throughput
+
+Mnemonic: adaptive batching keeps decode from starving behind prefill, while topology-aware scheduling keeps GPU traffic from piling onto the same NVLink/NVSwitch path.
+

@@ -1883,3 +1883,135 @@ What topology-aware scheduling tries to do
 
 Mnemonic: adaptive batching keeps decode from starving behind prefill, while topology-aware scheduling keeps GPU traffic from piling onto the same NVLink/NVSwitch path.
 
+NVLink congestion telemetry and adaptive process-GPU mapping
+
+Finite bandwidth reminder
+
+- NVLink/NVSwitch is huge, but not infinite
+- NVLink 5 port: ~100 GB/s per direction
+- GB200/GB300: 18 NVLink links per GPU
+- Per GPU: up to ~1.8 TB/s bidirectional throughput
+- Under balanced load, NVSwitch looks nonblocking
+- Under skewed load, links/switches can still congest
+
+Congestion patterns
+
+- Many-to-one:
+	- many GPUs send KV/activations to one GPU
+	- receiver ingress becomes bottleneck
+- All-at-once exchange:
+	- many GPUs communicate at the same time
+	- switch paths can oversubscribe
+- Cross-rack / cross-node:
+	- leaves NVLink domain
+	- uses InfiniBand/Ethernet
+	- higher latency and lower bandwidth
+
+Latency rough numbers
+
+- NVSwitch hop: <1 µs
+- InfiniBand NDR hop: ~5-10 µs
+- So locality matters a lot
+
+Do not guess topology
+
+- Query it programmatically:
+	- CUDA topology APIs
+	- NCCL topology hints
+	- NVML
+	- DCGM
+	- Fabric Manager / NVSwitch tooling
+- Goal: know which GPUs are close, which links are shared, and which paths are hot
+
+Real-time link telemetry
+
+- Need to observe congestion before scheduling around it
+- Useful counters:
+	- bytes per NVLink port
+	- per-link throughput
+	- error rates
+	- GPU-pair traffic
+	- NVSwitch/uplink hotspots
+- Preferred tools:
+	- NVML / `nvmlDeviceGetNvLinkUtilizationCounter`
+	- DCGM
+	- DCGM exporter → Prometheus → Grafana
+	- Nsight Systems for timeline views
+
+Monitoring caveat
+
+- NVLink counters have overhead
+- Sample at a reasonable interval
+- Do not poll so aggressively that monitoring hurts serving
+
+What Nsight can reveal
+
+- Transfers overlapping badly
+- Pipeline stages all sending at the same time
+- Kernels waiting on communication
+- Specific phases blocked on NVLink/NVSwitch traffic
+
+Scheduler reactions
+
+- If link hot:
+	- insert slight delay
+	- reschedule transfer later
+	- reroute to less-busy GPU/path
+	- reassign GPU roles
+	- schedule collectives in waves
+- This is feedback-driven communication scheduling
+
+Adaptive process-GPU mapping
+
+Core idea
+
+- Map model processes/layers to GPUs based on communication cost
+- Keep heavy tensor transfers local and balanced
+- Avoid placing communicating layers on far/congested GPUs
+
+Problem example
+
+	Bad mapping:
+		layer 0 on GPU0  ───── activation ─────► layer 2 on GPU2
+		path is far / congested
+
+	Better mapping:
+		layer 0 on GPU0  ──► layer 2 on nearby GPU1
+		shorter / faster / less congested path
+
+NVTAGS
+
+- NVIDIA Topology-Aware GPU Selection
+- Automatically maps processes to GPUs using:
+	- fabric distance
+	- link metrics
+	- observed communication patterns
+- Profiles topology and assigns GPU affinity to minimize communication cost
+
+When remapping helps
+
+- Large activation tensors between pipeline stages
+- Heavy KV transfers between specific GPUs
+- One link/switch path becoming saturated
+- Naive process placement crossing expensive paths
+
+If not using NVTAGS
+
+- Build/use a topology map manually
+- Group close GPUs together for strongly communicating processes
+- Keep pipeline-adjacent layers on nearby GPUs where possible
+
+Visual
+
+	Model graph:       Hardware graph:
+
+	L0 → L1 → L2       GPU0 --fast-- GPU1 --fast-- GPU2
+											 \                       /
+												---- slower path ------
+
+	Good placement:
+		L0 on GPU0, L1 on GPU1, L2 on GPU2
+		→ activations follow fast neighboring links
+
+Mnemonic: NVSwitch is an enormous highway, not teleportation — watch the link counters, avoid many-to-one traffic, and place communicating layers on nearby GPUs.
+

@@ -2015,3 +2015,172 @@ Visual
 
 Mnemonic: NVSwitch is an enormous highway, not teleportation — watch the link counters, avoid many-to-one traffic, and place communicating layers on nearby GPUs.
 
+Adaptive remapping and NCCL all-reduce tuning
+
+Adaptive process-GPU remapping
+
+- Remapping can happen:
+	- at initialization
+	- between inferences
+	- periodically after profiling
+- Goal: put high-traffic process pairs close together
+- If process 3 and process 4 exchange tens of GB/s:
+	- keep them on same node / same fast fabric when possible
+- Compute-heavy, low-communication processes can tolerate more distance
+
+Optimization view
+
+- Model processes/layers = graph nodes
+- Data movement between them = graph edges
+- Edge weight = GB/s transferred
+- Goal = graph partitioning / min-cut:
+	- keep heavy edges local
+	- push light edges across slower links if needed
+
+Remapping caveat
+
+- Moving a process/layer means moving model weights
+- Layers can be many GB
+- Do not remap too frequently
+- Best times:
+	- between large batches
+	- during quiet periods
+	- when mapping will remain stable long enough to pay back the move cost
+
+Visual
+
+	Before:
+		process 3 ── 50 GB/s cross-node ── process 4
+		→ slow / congested path
+
+	After:
+		process 3 and process 4 placed closer
+		→ traffic stays within node / NVSwitch domain
+		→ less cross-node bandwidth, lower latency
+
+NCCL collectives
+
+- NCCL = NVIDIA Collective Communications Library
+- Handles GPU collectives like:
+	- all-reduce
+	- all-gather
+	- broadcast
+	- reduce-scatter
+- In inference, collectives show up in:
+	- tensor-parallel all-reduce
+	- MoE expert output gathering
+	- parameter / activation broadcasts
+
+What all-reduce means
+
+- Each GPU starts with one partial result
+- All-reduce combines all partial results
+- Then every GPU receives the final combined result
+
+Visual: all-reduce sum
+
+	Start:
+		GPU0 has A
+		GPU1 has B
+		GPU2 has C
+		GPU3 has D
+
+	After all-reduce SUM:
+		GPU0 has A+B+C+D
+		GPU1 has A+B+C+D
+		GPU2 has A+B+C+D
+		GPU3 has A+B+C+D
+
+Why inference needs it
+
+- In tensor parallelism, each GPU computes a slice of a layer output
+- All-reduce combines slices so every GPU has the needed combined result
+
+Ring all-reduce
+
+- GPUs form a loop
+- Data chunks circulate around the ring
+- Every GPU sends to one neighbor and receives from another
+- Very bandwidth-efficient for large messages
+- But latency grows roughly linearly with GPU count
+
+Visual: ring
+
+	GPU0 ──► GPU1 ──► GPU2 ──► GPU3
+	 ▲                              │
+	 └──────────────────────────────┘
+
+	Good for:
+		large messages
+		bandwidth-dominated transfers
+		balanced, uncongested fabric
+
+	Bad for:
+		small latency-sensitive messages
+		very large GPU counts
+		congested long ring paths
+
+Tree all-reduce
+
+- GPUs form a logical tree
+- Reduce upward, then broadcast downward
+- Fewer sequential steps: about log2(N)
+- Lower latency for many GPUs / small messages
+- May not saturate every link as fully as ring
+
+Visual: tree reduce + broadcast
+
+				GPU0
+			 /    \
+		GPU1    GPU2
+		/  \    /  \
+	GPU3 GPU4 GPU5 GPU6
+
+	reduce: leaves → root
+	broadcast: root → leaves
+
+Ring vs tree
+
+	┌──────────────┬────────────────────────────┬────────────────────────────┐
+	│ Algorithm    │ Strength                   │ Weakness                   │
+	├──────────────┼────────────────────────────┼────────────────────────────┤
+	│ ring         │ max bandwidth for big data │ latency grows with N       │
+	│ tree         │ low latency, O(log N)      │ may underuse bandwidth     │
+	│ hierarchical │ mixes local ring/tree      │ more complex tuning        │
+	└──────────────┴────────────────────────────┴────────────────────────────┘
+
+72-GPU intuition
+
+- Ring: ~71 sequential hops
+- Tree: ~log2(72) ≈ 6-ish sequential levels
+- So tree often wins for latency-sensitive reductions at huge GPU count
+
+NCCL tuning
+
+- NCCL normally chooses ring/tree/hierarchical heuristically
+- Scheduler can override/tune based on:
+	- message size
+	- topology
+	- congestion
+	- GPU count
+- Example knob:
+	- `NCCL_ALGO=Tree`
+- General rule:
+	- small messages / latency-sensitive → tree
+	- huge messages / bandwidth-dominated → ring if fabric is not congested
+	- multi-node / mixed topology → hierarchical
+
+Overlap with compute
+
+- NCCL communication can run on one CUDA stream
+- GEMM compute can run on another
+- Good schedule overlaps all-reduce with useful compute when dependencies allow
+
+Visual
+
+	stream 0: [GEMM compute --------------]
+	stream 1:        [NCCL all-reduce ----]
+									 overlap hides comm cost
+
+Mnemonic: all-reduce means everyone contributes a partial and everyone gets the total; ring maximizes bandwidth by walking the loop, tree minimizes latency by reducing up and broadcasting down.
+

@@ -2184,3 +2184,158 @@ Visual
 
 Mnemonic: all-reduce means everyone contributes a partial and everyone gets the total; ring maximizes bandwidth by walking the loop, tree minimizes latency by reducing up and broadcasting down.
 
+Rotating rings, wave scheduling, and multirail RDMA
+
+Rotating ring endpoints
+
+- Ring is simple and bandwidth-efficient
+- But fixed ring order can overload the same links repeatedly
+- Especially the wraparound / critical GPU-pair links
+- Fix: rotate or shuffle ring ordering across collectives
+
+Visual: fixed ring
+
+	collective 1:
+		GPU0 → GPU1 → GPU2 → GPU3 → GPU0
+
+	collective 2:
+		GPU0 → GPU1 → GPU2 → GPU3 → GPU0
+
+	→ same neighbor pairs get hammered every time
+
+Visual: rotated ring
+
+	collective 1:
+		GPU0 → GPU1 → GPU2 → GPU3 → GPU0
+
+	collective 2:
+		GPU1 → GPU2 → GPU3 → GPU0 → GPU1
+
+	collective 3:
+		GPU2 → GPU3 → GPU0 → GPU1 → GPU2
+
+	→ heavy link duty moves around over time
+
+NCCL note
+
+- NCCL already alternates inside/outside ring directions on successive calls
+- Extra rank shuffling helps if workload is persistently imbalanced
+- Scheduler can reindex GPUs in communicator with permuted rank order
+- Effect: no single NVLink/GPU stays on the critical path forever
+
+Wave scheduling of collectives
+
+- Instead of one giant all-to-all across every GPU at once
+- Split communication into smaller phased waves
+- Reduces instantaneous fabric load
+
+Problem example
+
+- 72 GPUs all-to-all exchange
+- Naive:
+	- each GPU sends to 71 others at once
+	- 72 × 71 messages flood NVSwitch/NIC paths
+	- huge traffic spike
+
+Wave version
+
+- Split into 4 waves of 18 GPUs
+- Each wave does a smaller exchange
+- Stagger start times so one wave partly drains before next starts
+- This is temporal multiplexing: spread traffic over time
+
+Visual
+
+	Naive:
+		t0: [all 72 GPUs communicate at once]  → giant spike
+
+	Waves:
+		t0: [wave 1: 18 GPUs]
+		t1:        [wave 2: 18 GPUs]
+		t2:               [wave 3: 18 GPUs]
+		t3:                      [wave 4: 18 GPUs]
+		→ smoother traffic, less congestion
+
+NCCL relation
+
+- NCCL internally slices data for pipelining, especially in rings
+- Scheduler can also orchestrate smaller collectives externally
+- Useful when whole-cluster collectives would create a burst
+
+Overlap compute and communication
+
+- If reduction happens in waves:
+	- later communication waves can overlap with next-layer compute
+- Some GPUs compute while others finish communication
+- This time-shifts network traffic into otherwise idle gaps
+
+Visual
+
+	time →
+	comm wave 1: [reduce]
+	compute:          [next layer compute -----]
+	comm wave 2:          [reduce]
+	compute:                       [next compute]
+
+Why wave scheduling helps
+
+- Avoids massive one-time NVSwitch/NIC spike
+- Improves fairness between transfers
+- Keeps bandwidth busy without overwhelming it
+- Similar to pacing network traffic to avoid burstiness
+
+Multinode / multirack communication
+
+- Beyond one NVL72 rack, GPUs communicate through NICs and network switches
+- NVLink/NVSwitch no longer connects every GPU directly
+- Internode paths use InfiniBand / Ethernet
+- These are slower and higher-latency than intrarack NVLink
+
+GPUDirect RDMA
+
+- Lets remote GPUs read/write GPU memory directly through NICs
+- Avoids CPU host-memory bounce buffers
+- Still limited by network bandwidth and congestion
+
+Visual
+
+	Bad path:
+		GPU → CPU RAM → NIC → network → CPU RAM → GPU
+
+	GPUDirect RDMA:
+		GPU HBM → NIC → network → NIC → GPU HBM
+
+Multirail networking
+
+- High-end GPU servers often have multiple NICs / IB ports
+- Using two NICs can approach ~2× throughput vs one NIC
+- NCCL can split rings/trees across NICs
+- Separate NICs often connect to separate network rails / switches
+
+NCCL_CROSS_NIC
+
+- Controls whether NCCL can use different NICs across nodes for one collective
+- With good topology, enable for large collectives
+- Example effect:
+	- half traffic exits NIC1
+	- half traffic exits NIC2
+	- less bottleneck on one rail
+
+Congestion-aware internode scheduling
+
+- If one NIC/path is saturated:
+	- move traffic to another NIC
+	- use alternate route
+	- split transfers into smaller chunks
+	- let network adaptive routing balance flows
+- Application can influence this with NCCL channel/NIC assignment
+
+NIC affinity
+
+- Bind each GPU to the closest NIC
+- Usually same PCIe root complex / same CPU or NVSwitch complex
+- Reduces local PCIe/CPU contention before data even reaches the network
+
+Mnemonic: rotate rings so one link is not always hot, send collectives in waves so the fabric is not flooded all at once, and stripe multinode traffic across NIC rails with GPUDirect RDMA.
+
+

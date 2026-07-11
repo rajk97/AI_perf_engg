@@ -2338,4 +2338,174 @@ NIC affinity
 
 Mnemonic: rotate rings so one link is not always hot, send collectives in waves so the fabric is not flooded all at once, and stripe multinode traffic across NIC rails with GPUDirect RDMA.
 
+GPU-NIC affinity, MoE expert placement, and dynamic congestion control
+
+GPU-NIC affinity
+
+- Map each GPU to its closest NIC
+- Use NVML / NCCL / topology files to learn locality
+- Example mapping:
+	- GPUs 0-3 → NIC 0
+	- GPUs 4-7 → NIC 1
+- Goal: shortest path out of the node
+
+Why affinity matters
+
+- Bad mapping:
+	- GPU traffic crosses PCIe/CPU/NVSwitch boundaries before reaching NIC
+	- adds local contention before the data even enters the network
+- Good mapping:
+	- GPU sends through nearest NIC
+	- lower latency, less internal node congestion
+
+Manual overrides
+
+- NCCL autotuning handles many cases
+- But persistent hotspots may require manual/static topology hints
+- If NIC 0 is saturated:
+	- scheduler can move some GPU traffic to NIC 1 next round
+	- or assign NCCL channels to less-used NICs
+
+Extreme cluster case: massive MoE
+
+- MoE inference creates heavy cross-node traffic
+- Token router sends tokens to expert GPUs
+- Results are gathered back
+- Without tuning, network becomes the bottleneck
+
+Two ways to reduce cross-node traffic
+
+- Replicate hot data/experts
+	- popular expert exists on multiple nodes
+	- tokens can use nearer copy
+- Hierarchical aggregation
+	- aggregate within node first
+	- exchange compact summaries across nodes
+	- avoid full all-to-all across every GPU
+
+NVIDIA SHARP
+
+- Offloads some aggregation into switch hardware
+- Helps reduce communication bottlenecks
+- Works well with adaptive routing in large clusters
+
+Network as a schedulable resource
+
+- Treat network like GPUs / HBM:
+	- monitored
+	- allocated
+	- balanced
+	- adapted dynamically
+- At large scale, one slow link can throttle the whole distributed inference pipeline
+
+MoE expert rebalancing
+
+Why MoE creates special traffic
+
+- Experts live on different GPUs
+- Each token is routed to top-k experts
+- This creates all-to-all-like traffic:
+	- tokens go to expert GPUs
+	- expert outputs come back
+
+Problems with static expert placement
+
+- Popular experts become hotspots
+- Experts often used together may be placed far apart
+- Tokens repeatedly travel long NVLink/NVSwitch/network paths
+
+Expert rebalancing
+
+- Periodically move experts to better GPUs/nodes
+- Based on logged routing/traffic stats
+- Goals:
+	- spread popular experts
+	- colocate experts that are often used together
+	- keep traffic inside local NVLink/NVSwitch groups when possible
+
+Visual
+
+	Bad placement:
+		expert 5 on GPU0
+		expert 19 on GPU71
+		same tokens often need both → long fabric path every time
+
+	Better placement:
+		expert 5 + expert 19 on same GPU/node/group
+		→ traffic stays local
+
+Hot expert example
+
+- Expert 7 receives too many tokens
+- Scheduler can:
+	- move it to a less-busy GPU
+	- duplicate it if supported
+	- split token load across copies
+
+Rebalancing caveat
+
+- Experts are model weights
+- Moving them can mean transferring GBs
+- Do it infrequently:
+	- maintenance windows
+	- between large batches
+	- after enough routing stats prove the change is worth it
+
+Expert grouping / bucketing
+
+- Put commonly co-used experts in same group of GPUs
+- Group can be:
+	- same server
+	- same NVSwitch island
+	- same rack-local domain
+- Reduces cross-group traffic
+
+Graph partitioning view
+
+- Nodes = experts / GPUs
+- Edges = token traffic between router and experts, or expert-expert co-use
+- Edge weight = traffic volume
+- Partition graph to minimize heavy edges crossing topology boundaries
+
+Key idea
+
+- MoE regrouping rearranges the workload to fit the network
+- Not the network to fit the workload
+
+Dynamic congestion-aware scheduling
+
+- Continuously monitor link/NIC/switch telemetry
+- Adjust in real time:
+	- throttle
+	- reroute
+	- reorder
+	- delay
+	- remap
+
+Temporal load balancing
+
+- If a link is maxed out by one big transfer
+- And another transfer wants same link
+- Scheduler delays the second by a few ms
+- Better to queue briefly than overload the fabric
+
+Visual
+
+	Bad:
+		t0: transfer A uses link 0
+		t0: transfer B also uses link 0
+		→ queue buildup / congestion
+
+	Better:
+		t0: transfer A uses link 0
+		t1: transfer B uses link 0 after A drains
+		→ smoother utilization
+
+Analogy
+
+- Like network packet routing / backpressure
+- Small scheduling delays prevent bigger congestion stalls
+
+Mnemonic: bind GPUs to nearby NICs, colocate experts that co-activate, replicate hot experts when needed, and delay/reroute transfers before one saturated link slows the whole cluster.
+
 

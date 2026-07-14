@@ -2508,4 +2508,163 @@ Analogy
 
 Mnemonic: bind GPUs to nearby NICs, colocate experts that co-activate, replicate hot experts when needed, and delay/reroute transfers before one saturated link slows the whole cluster.
 
+Idle-slot filling, adaptive routing, and fine-tuned NVSwitch scheduling
+
+Idle-slot filling
+
+- Sometimes a big transfer is ready soon, but source GPU is still computing
+- Link would sit idle
+- Scheduler can use that gap for lower-priority traffic
+- Critical transfer still gets the link when ready
+
+Visual
+
+	time →
+	critical transfer:      [WAIT compute] [SEND big data]
+	low-priority transfer:  [send in idle gap]
+
+	Result: bandwidth used without blocking critical path
+
+Software adaptive routing
+
+- If one path is congested, choose another path
+- Useful when system has:
+	- multiple NVSwitch planes
+	- multiple NIC rails
+	- multiple NCCL path options
+- NCCL does some internally
+- Advanced scheduler can keep multiple NCCL communicators:
+	- communicator A → path/rail/plane 0
+	- communicator B → path/rail/plane 1
+	- choose based on telemetry
+
+Virtual channels / HQOS
+
+- Modern NVSwitch can support:
+	- multiple virtual channels
+	- hardware quality-of-service settings
+- Urgent traffic uses high-priority channel
+- Nonurgent traffic uses lower-priority channel
+- Prevents background transfers from fighting critical transfers
+
+Load-dependent task scheduling
+
+- Queries share GPUs, NVLink, NVSwitch, NICs
+- Scheduler can queue/reorder some query steps
+- Goal: avoid peak overlap of heavy collectives
+
+Example
+
+	Query A next step: massive all-gather
+	Query B next step: another massive all-gather
+
+	Naive:
+		t0: A all-gather + B all-gather → congestion spike
+
+	Scheduled:
+		t0: A all-gather
+		t1: B all-gather
+		→ smoother traffic, lower latency tail
+
+Self-tuning waves
+
+- Scheduler watches live telemetry
+- If 8 parallel queries spike NVSwitch use:
+	- try 4 queries in wave 1
+	- then 4 queries in wave 2
+- Learns congestion patterns from recent behavior
+- Policy can be:
+	- heuristic rules
+	- RL agent
+
+Backpressure-aware scheduling
+
+- Destination GPU can become full / slow
+- Receiver signals source to pause incoming transfers
+- NCCL already applies backpressure when receiver cannot keep up
+- Custom scheduler can notice blocked sends
+- Then source GPU does useful compute while waiting
+
+Visual
+
+	Before:
+		source GPU: [blocked send............]
+		dest GPU:   [buffers full]
+
+	After:
+		source GPU: [blocked send] [local compute] [resume send]
+		dest GPU:   [drain buffers]              [receive]
+
+NVSwitch fine-tuned scheduling
+
+- NVSwitch is a high-bandwidth crossbar
+- Hardware already does adaptive routing/fairness
+- Software adds application knowledge:
+	- tensor parallel steps
+	- pipeline stages
+	- expert gather/broadcast timing
+	- query priorities
+- Goal: keep fabric busy, not oversubscribed
+
+Centralized fan-in problem
+
+- NVL72 example:
+	- 72 GPUs total
+	- GPU0 collects results
+	- 71 GPUs send to GPU0
+	- GPU0 has 18 NVLink links
+- If all 71 send at once:
+	- burst > GPU0 link capacity
+	- NVSwitch buffers/serializes
+	- latency spike
+
+Wave-staggered fan-in
+
+	group 1: GPUs 1-18  → GPU0
+	group 2: GPUs 19-36 → GPU0
+	group 3: GPUs 37-54 → GPU0
+	group 4: GPUs 55-71 → GPU0
+
+	At any instant: about 18 senders
+	Fits GPU0's 18-port capacity
+	Traffic arrives as smooth waves
+
+All-to-all shuffle / butterfly pattern
+
+- Break all-to-all into pairwise rounds
+- Each timestep chooses who talks to whom
+- Keeps ports busy without overload
+
+Visual
+
+	round 1: GPU0↔GPU1, GPU2↔GPU3
+	round 2: GPU0↔GPU2, GPU1↔GPU3
+	round 3: GPU0↔GPU3, GPU1↔GPU2
+
+Time-sliced communication
+
+- Allocate slots to GPU pairs/groups
+- Many small synchronized steps
+- Like time-division multiplexing
+- Predictable use of NVSwitch crossbar
+
+Concurrency control
+
+- Limit number of heavy transfers running together
+- Example:
+	- avoid 12 expert-gathers at once
+	- run 2-4 large transfers at a time
+	- launch next set after previous drains
+- Slightly less parallelism
+- Often faster overall because congestion is avoided
+
+Core idea
+
+- Schedule communication like GPU kernels / CPU threads
+- High-priority traffic avoids interference
+- Low-priority traffic fills idle gaps
+- Heavy flows are staggered, not blindly overlapped
+
+Mnemonic: fill idle links with low-priority work, route around busy paths, treat backpressure as a compute opportunity, and wave-stagger NVSwitch traffic so the fabric stays busy without flooding.
+
 

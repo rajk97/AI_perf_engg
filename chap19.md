@@ -2667,4 +2667,201 @@ Core idea
 
 Mnemonic: fill idle links with low-priority work, route around busy paths, treat backpressure as a compute opportunity, and wave-stagger NVSwitch traffic so the fabric stays busy without flooding.
 
+Congestion-aware scheduling wrap-up and extra adaptive techniques
+
+Communication fabric as shared resource
+
+- Treat NVLink/NVSwitch/NIC fabric like:
+	- GPU kernels
+	- CPU threads
+	- memory bandwidth
+- Schedule it deliberately
+- High-priority traffic avoids interference
+- Low-priority traffic fills idle gaps
+
+Why it matters for inference
+
+- Staggering + grouping increases effective throughput
+- Avoids severe contention patterns
+- Reduces tail latency from congested outlier requests
+- Makes communication more predictable
+
+Big picture
+
+- Match communication pattern to hardware layout
+- Runtime watches topology + telemetry
+- Then adapts:
+	- task placement
+	- collective algorithm choice
+	- NIC / rail routing
+	- MoE expert placement
+	- transfer timing
+	- congestion response
+
+Visual
+
+	Bad:
+		workload pattern ignores hardware
+		→ hot links, queues, tail latency
+
+	Good:
+		workload pattern shaped around topology
+		→ smoother links, lower latency
+
+Additional adaptive optimization techniques
+
+Dynamic early-exit networks
+
+- Model exits early when confidence is high
+- Watch intermediate representations / logit entropy
+- Easy inputs skip later layers/tokens
+- Needs special architecture / auxiliary classifiers
+- Possible speedup: ~30%-50% on some reasoning tasks
+
+Visual
+
+	Hard input: layer1 → layer2 → layer3 → ... → final
+	Easy input: layer1 → layer2 → confident → exit
+
+Input-aware layer skipping: DASH
+
+- Treat layer execution as MDP
+- Per token, decide:
+	- run layer
+	- skip layer
+- Small scoring/gating network controls decisions
+- Can skip ~20%-40% of layers for many tokens
+- Needs modified model with gates
+
+Speculative MoE expert routing
+
+- Predict which experts upcoming tokens will use
+- Send tokens / arrange expert work early
+- If prediction right:
+	- less cross-node communication
+	- better expert locality
+- If wrong:
+	- wasted work
+- Can reduce bandwidth versus static EP + TP when predictions are good
+
+Dynamic token pruning: LazyLLM
+
+- Score token importance cheaply
+- Compute KV cache mainly for important tokens
+- Prune low-impact tokens from prefill/decode
+- Helps long-context workloads
+- Reported latency reduction: ~20%-30%
+
+Visual
+
+	Prompt tokens:
+		[important] [filler] [important] [stopword] [important]
+
+	Lazy attention:
+		[keep]      [skip]   [keep]      [skip]     [keep]
+
+Edge-oriented MoE memory budgeting
+
+- Edge devices cannot keep all experts in GPU memory
+- Keep frequent experts resident
+- Swap rare experts from flash/storage as needed
+- Works better with low-bit expert weights
+- Goal: high activation coverage with lower memory
+
+Dynamic quantization / activation ranges
+
+- Adjust activation quantization during inference
+- Use sliding-window stats every N tokens
+- Cool layers:
+	- low variance
+	- narrow range
+	- FP8 is usually enough
+- Hot layers:
+	- high variance
+	- wider range
+	- keep FP16/BF16
+
+Transformer Engine FP8 note
+
+- Hybrid FP8 strategy:
+	- E4M3 for forward activations/weights
+	- E5M2 for backward gradients
+- Delayed scaling tracks recent activation maxima
+- Common setting:
+	- `amax_history_len=1024`
+	- `amax_compute_algo="max"`
+
+Why FP8 works for cool layers
+
+- Activations cluster near mean
+- Narrow dynamic range
+- E4M3 can represent values accurately enough
+- Saves compute + memory with little accuracy loss
+
+Chapter 19 key takeaways
+
+Steady-state inference
+
+- Use `torch.compile`
+- Prefer `mode="reduce-overhead"` for low-latency serving
+- Autotune modes help if warmup is acceptable
+
+Kernel autotuning
+
+- Tune kernels / tiles dynamically
+- Use TMA async prefetch when available
+- Prefer CUTLASS / Triton / cuBLASLt autotuning before hand-tuning
+
+Adaptive precision
+
+- Switch FP8 / FP4 / FP16 based on runtime needs
+- Use Transformer Engine for FP8 in PyTorch
+- `torch.autocast()` does not directly provide FP8
+
+Disaggregated inference
+
+- Separate prefill and decode resources
+- Route requests by:
+	- KV cache hits
+	- queue depth
+	- prompt length
+	- load
+- Protect short prompts from long-prompt slowdowns
+
+Dynamic parallelism
+
+- Choose DP / TP / PP / hybrid at runtime
+- Account for:
+	- sequence length
+	- output length
+	- model structure
+	- MoE routing
+- Decide when to shard vs replicate
+
+Adaptive decoding + scheduling
+
+- Speculative decoding
+- In-flight batch reshaping
+- Token-level scheduling
+- Used in vLLM / SGLang / TensorRT-LLM style engines
+
+Memory management
+
+- Offload cold KV pages to CPU / NVMe
+- Use unified addressing / Grace CPU memory when available
+- Use `cudaMemAdvise` and `cudaMemPrefetchAsync`
+- GPUDirect Storage can bypass CPU for NVMe → GPU movement
+
+Profiling-driven optimization
+
+- Observe first, tune second
+- Tools:
+	- NVML
+	- Nsight Systems / Compute
+	- NVTX
+	- Prometheus metrics
+- Telemetry can trigger graph/kernel/scheduling changes automatically
+
+Mnemonic: observe live runtime signals, then adapt the cheapest knob first: compile, kernels, precision, batching, memory, parallelism, topology, and finally experimental skip/exit/prune tricks.
+
 

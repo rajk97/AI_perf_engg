@@ -493,3 +493,282 @@ Final idea
 - Best performance teams use AI as an always-on optimizer, not just a chatbot
 
 Mnemonic: future performance work is guide, verify, and guardrail; let compilers tune kernels, let agents operate clusters, and let humans steer the objectives.
+
+Scaling to multimillion GPU clusters and 100T-parameter models
+
+Big question
+
+- We crossed trillion-parameter models
+- Next target: 10T-100T+ parameters
+- Needs full-stack scaling:
+	- hardware
+	- memory
+	- networking
+	- software
+	- algorithms
+	- AI-assisted optimization
+
+Hardware pressure
+
+- 100T parameters means huge storage + movement cost
+- Need more:
+	- HBM capacity
+	- HBM bandwidth
+	- interconnect bandwidth
+	- cluster-scale memory
+
+HBM trend
+
+- HBM3e: Blackwell generation
+- HBM4: Rubin generation
+- HBM4 roughly doubles bandwidth per stack again
+- Possible future GPU boards:
+	- 512 GB HBM
+	- 1 TB HBM
+- More model state fits locally
+- Less swapping / sharding pressure
+
+Visual
+
+	Before:
+		model shard spread across many GPUs
+		→ lots of communication
+
+	After:
+		more params fit per GPU
+		→ fewer shards, less traffic, lower latency
+
+Mega-GPU cluster idea
+
+- Link many NVL72 racks together
+- Goal: many GPUs act like one giant accelerator
+- Needs NVLink/NVSwitch or similar fabric to keep scaling
+- Communication wall is the real enemy
+
+Low precision is mandatory
+
+- FP8 / FP4 already matter
+- Future may use even lower precision for some parts
+- Hybrid strategy:
+	- low precision for most layers
+	- higher precision for sensitive layers
+- Without low precision, 100T training is too slow/expensive
+
+Sparse and conditional compute
+
+- Do not activate all 100T parameters per token
+- MoE is the main pattern:
+	- huge total model
+	- small active subset per token
+- Throughput depends on:
+	- GEMM speed
+	- expert routing
+	- expert placement
+	- expert-output caching
+	- sparse communication
+
+MoE placement intuition
+
+	Good:
+		right expert near right tokens
+		→ less network traffic
+
+	Bad:
+		experts far from tokens
+		→ cross-rack traffic dominates
+
+Memory-efficient algorithms
+
+- Adam-like optimizers keep extra state:
+	- momentum
+	- variance
+- This can triple memory use
+- 100T weights can imply 200T extra optimizer values
+- Need memory-saving optimizers:
+	- Adafactor
+	- Shampoo-style methods
+	- sharded optimizer states
+
+Activation checkpointing
+
+- Store fewer activations
+- Recompute during backward pass
+- Trades compute for memory
+- At 100T scale: likely aggressive/default
+
+Rotating weight updates
+
+- Radical idea: do not update every weight every step
+- Update subsets over time
+- Reduces per-step compute and communication
+- Question to keep asking:
+	- do we need this operation this often?
+	- do we need this precision here?
+
+Network and infrastructure
+
+- 10,000+ GPUs means fabric matters as much as GPUs
+- Need:
+	- high bisection bandwidth
+	- adaptive routing
+	- fault tolerance
+	- fast checkpoint/restart
+	- topology-aware scheduling
+- Spectrum-X example:
+	- Ethernet/RoCE fabric optimized for AI
+	- adaptive routing
+	- reduced congestion
+
+Unified memory at giant scale
+
+- Goal: huge memory space across GPU/CPU/storage
+- Programmer sees something closer to one pool
+- Runtime handles placement/prefetch
+- Tools:
+	- Unified Memory
+	- `cudaMemPrefetchAsync()`
+	- on-demand paging
+- At 100T scale, page placement becomes critical
+
+Datacenter-scale thinking
+
+- Frontier clusters may reach 1M+ GPUs
+- One training job may span a datacenter
+- Performance engineer must think at:
+	- node scale
+	- rack scale
+	- datacenter scale
+	- maybe multidatacenter scale
+
+Socio-technical scaling
+
+- Biggest models may exceed one team/company
+- More like big science projects
+- Needs shared standards:
+	- checkpoint formats
+	- training code
+	- reproducibility
+	- fault-tolerant snapshots
+	- multiparty ownership
+
+100T model recipe
+
+	More HBM + faster fabric
+	+ low precision
+	+ sparse MoE
+	+ memory-efficient optimizers
+	+ checkpointing
+	+ topology-aware scheduling
+	+ AI-assisted compilers/agents
+	= feasible ultrascale model
+
+Chapter 20 key takeaways
+
+Codesign wins
+
+- Real performance comes from hardware + software + algorithms together
+- Not one isolated trick
+
+AI-assisted optimization works
+
+- AlphaTensor: algorithm discovery for GEMM
+- NVIDIA / DeepSeek-R1: CUDA attention kernels
+- Predibase: RL-generated Triton kernels
+- Pattern:
+	- generate
+	- verify
+	- benchmark
+	- refine
+
+100T strategies
+
+- Aggressive quantization
+- Multidimensional parallelism:
+	- data
+	- tensor
+	- pipeline
+	- expert
+	- context/sequence
+- Careful inter-rack communication
+- Smart scheduling is as important as raw FLOPs
+
+Compute scaling
+
+- Future AI datacenters aim for 100x-1000x more training FLOPs
+- Bigger compute enables bigger models
+- But efficiency decides cost and feasibility
+
+Future AI agents
+
+- Generate code
+- Optimize kernels
+- Continually learn
+- Debug systems
+- Possibly rewrite/improve their own methods
+- Compress the time between breakthroughs
+
+AI-assisted troubleshooting
+
+- Watch logs, metrics, traces
+- Detect:
+	- accuracy/loss spikes
+	- NaNs
+	- hardware errors
+	- memory stalls
+	- network anomalies
+- Suggest fixes or trigger automated actions
+
+Performance per watt
+
+- Core metric:
+	- tokens/sec/$/watt
+- More useful than raw peak FLOPs alone
+- Grace Blackwell NVL72 claims major perf-per-watt gains over Hopper-era systems
+- Lower watts per token = lower cost per token
+
+Book-level conclusion
+
+- AI systems performance engineering is now full-stack
+- Scope expanded from single kernels to:
+	- rack-scale systems
+	- inference engines
+	- network fabrics
+	- memory hierarchy
+	- AI-assisted optimization loops
+	- datacenter-level scheduling
+
+Mechanical sympathy
+
+- Best systems understand the hardware deeply
+- Tensor Cores, Transformer Engine, NVLink, NVSwitch, SHARP, HBM, KV cache, schedulers all matter
+- Hardware/software/algorithm codesign is the winning pattern
+
+Smart scaling over brute-force scaling
+
+- Do more useful work per cycle
+- Avoid wasted communication
+- Use lower precision when safe
+- Let AI tools handle routine tuning
+- Humans focus on architecture, constraints, and new ideas
+
+Final role of performance engineer
+
+- Spot bottlenecks
+- Guide AI tools
+- Verify recommendations
+- Build robust systems
+- Balance:
+	- efficiency
+	- reliability
+	- cost
+	- sustainability
+
+Final mindset
+
+- Keep fundamentals strong
+- Stay curious
+- Experiment with new hardware/software
+- Trust AI recommendations only with verification
+- Adapt as the field moves into larger, stranger systems
+
+Mnemonic: 100T-scale AI needs bigger memory, faster fabric, lower precision, sparse activation, smarter algorithms, AI-assisted tuning, and humans who can verify the whole stack.
